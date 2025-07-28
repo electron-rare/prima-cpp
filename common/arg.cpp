@@ -2060,6 +2060,13 @@ gpt_params_context gpt_params_parser_init(gpt_params & params, llama_example ex,
         }
     ));
     add_opt(llama_arg(
+        {"--dump-folder"}, "FOLDER",
+        "folder to dump network communication tensors (no dumping if unset)",
+        [](gpt_params & params, const std::string & value) {
+            params.dump_folder = value;
+        }
+    ));
+    add_opt(llama_arg(
         {"--positive-file"}, "FNAME",
         format("positive prompts file, one prompt per line (default: '%s')", params.cvector_positive_file.c_str()),
         [](gpt_params & params, const std::string & value) {

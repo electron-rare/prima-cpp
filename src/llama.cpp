@@ -93,6 +93,67 @@
 #include <regex>
 #include <inttypes.h>
 #include <iomanip>
+#include <string>
+#include <iostream>
+
+int g_llama_send_tensors_counts = 0;
+int g_llama_recv_tensors_counts = 0;
+
+enum class TensorDataType : uint8_t {
+    FLOAT32 = 0,
+    // Add other data types as needed
+};
+
+/**
+ * @brief Dumps a raw data buffer (tensor) to a binary file with shape and size header.
+ * The created binary file has the following structure:
+ * 1. Element Type (uint8_t): A numeric code representing the data type.
+ * 2. N_Embed (uint64_t): The embedding dimension (width).
+ * 3. N_Tokens (uint64_t): The number of tokens (height).
+ * 4. Tensor Size (uint64_t): The total size of the tensor data in bytes.
+ * 5. Tensor Data (void*): The raw bytes of the tensor.
+ *
+ * @param dump_path The full path where the file will be saved.
+ * @param element_type A code representing the data type of the tensor elements.
+ * @param n_embed The embedding dimension (width).
+ * @param n_tokens The number of tokens (height).
+ * @param tensor_size The total size of the tensor data in bytes.
+ * @param ptr A const void pointer to the beginning of the tensor data.
+ */
+void dump_tensors(const std::string& dump_path,
+                  uint8_t element_type,
+                  uint64_t n_embed,
+                  uint64_t n_tokens,
+                  uint64_t tensor_size, 
+                  const void* ptr) {
+    // Open the file for binary writing
+    // std::ios::binary ensures data is written byte-for-byte without modification.
+    // std::ios::trunc ensures that if the file exists, it's overwritten.
+    std::ofstream outfile(dump_path, std::ios::binary | std::ios::trunc);
+
+    if (!outfile.is_open()) {
+        std::cerr << "Error: Could not open file for writing: " << dump_path << std::endl;
+        return;
+    }
+
+    // Write the header and data
+    try {
+        outfile.write(reinterpret_cast<const char*>(&element_type), sizeof(element_type));
+        outfile.write(reinterpret_cast<const char*>(&n_embed), sizeof(n_embed));
+        outfile.write(reinterpret_cast<const char*>(&n_tokens), sizeof(n_tokens));
+        outfile.write(reinterpret_cast<const char*>(&tensor_size), sizeof(tensor_size));
+        outfile.write(reinterpret_cast<const char*>(ptr), tensor_size);
+
+        if (!outfile) {
+             std::cerr << "Error: A failure occurred while writing to " << dump_path << std::endl;
+        } else {
+            std::cout << "Successfully dumped tensor to: " << dump_path << std::endl;
+        }
+
+    } catch (const std::exception& e) {
+        std::cerr << "An exception occurred during file write: " << e.what() << std::endl;
+    }
+}
 
 std::string get_iso8601_ms_timestamp() {
     auto now = std::chrono::system_clock::now();
@@ -2641,6 +2702,8 @@ struct llama_cparams {
 
     ggml_backend_sched_eval_callback cb_eval;
     void * cb_eval_user_data;
+
+    const char * dump_folder;
 };
 
 // TODO: separate into "llama_layer_enc" and "llama_layer_dec"
@@ -18035,7 +18098,8 @@ static int llama_recv_meta(zmq::socket_t & socket, struct sync_meta * meta) {
     return 0;
 }
 
-static void llama_send_tensors(zmq::socket_t & socket, struct llama_ubatch * ubatch, struct input_tensors * tensors) {
+static void llama_send_tensors(zmq::socket_t & socket, struct llama_ubatch * ubatch, struct input_tensors * tensors, const char * dump_folder = nullptr) {
+    g_llama_send_tensors_counts++;
     try {
         std::vector<zmq::message_t> send_msgs;
         size_t buf_size = 0;
@@ -18044,6 +18108,14 @@ static void llama_send_tensors(zmq::socket_t & socket, struct llama_ubatch * uba
         send_msgs.emplace_back(tensors->sub_gf_out->ne, sizeof(tensors->sub_gf_out->ne));
         buf_size = tensors->sub_gf_out->ne[0] * tensors->sub_gf_out->ne[1] * sizeof(float);
         send_msgs.emplace_back(ubatch->backend_embd, buf_size);
+        
+        if (dump_folder && strlen(dump_folder) > 0) {
+            std::string dump_path = std::string(dump_folder) + "/send_" + std::to_string(g_llama_send_tensors_counts) + ".bin";
+            dump_tensors(dump_path, static_cast<uint8_t>(TensorDataType::FLOAT32), 
+                        static_cast<uint64_t>(tensors->sub_gf_out->ne[0]), 
+                        static_cast<uint64_t>(tensors->sub_gf_out->ne[1]), 
+                        buf_size, ubatch->backend_embd);
+        }
 
         if (tensors->inp_pos) {
             send_msgs.emplace_back("inp_pos", strlen("inp_pos"));
@@ -18058,7 +18130,8 @@ static void llama_send_tensors(zmq::socket_t & socket, struct llama_ubatch * uba
     }
 }
 
-static void llama_recv_tensors(zmq::socket_t & socket, struct llama_ubatch * ubatch, const bool is_out_embd=false) {
+static void llama_recv_tensors(zmq::socket_t & socket, struct llama_ubatch * ubatch, const bool is_out_embd=false, const char * dump_folder = nullptr) {
+    g_llama_recv_tensors_counts++;
     std::vector<zmq::message_t> recv_msgs;
     if (!zmq::recv_multipart(socket, std::back_inserter(recv_msgs))) {
         LLAMA_LOG_INFO("Failed to receive tensor data.\n");
@@ -18075,6 +18148,14 @@ static void llama_recv_tensors(zmq::socket_t & socket, struct llama_ubatch * uba
             size_t    buf_size   = dims[0] * dims[1] * sizeof(float);
             float   * batch_embd = is_out_embd ? ubatch->out_embd : ubatch->backend_embd;
             std::memcpy(batch_embd, data_msg.data(), buf_size);
+            
+            if (dump_folder && strlen(dump_folder) > 0) {
+                std::string dump_path = std::string(dump_folder) + "/recv_" + std::to_string(g_llama_recv_tensors_counts) + ".bin";
+                dump_tensors(dump_path, static_cast<uint8_t>(TensorDataType::FLOAT32), 
+                            static_cast<uint64_t>(dims[0]), 
+                            static_cast<uint64_t>(dims[1]), 
+                            buf_size, data_msg.data());
+            }
         } else if (key == "inp_pos") {
             int64_t * dims  = static_cast<int64_t *>(dims_msg.data());
             size_t buf_size = dims[0] * sizeof(int32_t);
@@ -18502,7 +18583,7 @@ static int llama_decode_internal(
             // receive data from other nodes
             if (n_world > 1 && !(my_rank == 0 && i == 0) && !(my_rank == 0 && is_last_l)) {
                 LLAMA_LOG_INFO("[%d][%s][comm][start][recv_tensors][sbatch_tokens: %lu, ubatch_tokens: %u, receive data from other nodes]\n", my_rank, get_iso8601_ms_timestamp().c_str(), lctx.sbatch.n_tokens, ubatch.n_tokens);
-                llama_recv_tensors(*lctx.recv_socket, &ubatch, is_out_embd);
+                llama_recv_tensors(*lctx.recv_socket, &ubatch, is_out_embd, lctx.cparams.dump_folder);
                 LLAMA_LOG_INFO("[%d][%s][comm][end][recv_tensors][sbatch_tokens: %lu, ubatch_tokens: %u, receive data from other nodes]\n", my_rank, get_iso8601_ms_timestamp().c_str(), lctx.sbatch.n_tokens, ubatch.n_tokens);
             }
 
@@ -18578,7 +18659,7 @@ static int llama_decode_internal(
                 struct input_tensors tensors = {sub_gf_out, lctx.inp_pos};
                 const bool is_to_master = my_rank != 0 && is_last_l;
                 zmq::socket_t * s = is_to_master ? lctx.master_socket : lctx.send_socket;
-                llama_send_tensors(*s, &ubatch, &tensors);
+                llama_send_tensors(*s, &ubatch, &tensors, lctx.cparams.dump_folder);
                 LLAMA_LOG_INFO("[%d][%s][comm][end][send_tensors][sbatch_tokens: %lu, ubatch_tokens: %u, send the result to the next node or the master]\n", my_rank, get_iso8601_ms_timestamp().c_str(), lctx.sbatch.n_tokens, ubatch.n_tokens);
             }
 
@@ -20331,6 +20412,7 @@ struct llama_context_params llama_context_default_params() {
         /*.no_perf                     =*/ true,
         /*.abort_callback              =*/ nullptr,
         /*.abort_callback_data         =*/ nullptr,
+        /*.dump_folder                 =*/ nullptr,
     };
 
     return result;
@@ -20841,6 +20923,7 @@ struct llama_context * llama_new_context_with_model(
     ctx->cparams.n_world = params.n_world;
     ctx->cparams.rank    = params.rank;
     ctx->cparams.force   = params.force;
+    ctx->cparams.dump_folder = params.dump_folder;
     ctx->cparams.original_next_rank = (params.rank + 1) % params.n_world;
     return ctx;
 }

@@ -2011,6 +2011,15 @@ struct llama_context_params llama_context_params_from_gpt_params(const gpt_param
     }
     cparams.next_node_ip      = new char[params.next_node_ip.length() + 1];
     std::strcpy(cparams.next_node_ip, params.next_node_ip.c_str());
+    if (cparams.dump_folder != nullptr) {
+        delete[] cparams.dump_folder;
+    }
+    if (!params.dump_folder.empty()) {
+        cparams.dump_folder = new char[params.dump_folder.length() + 1];
+        std::strcpy(const_cast<char*>(cparams.dump_folder), params.dump_folder.c_str());
+    } else {
+        cparams.dump_folder = nullptr;
+    }
 
     cparams.n_ctx             = params.n_ctx;
     cparams.n_predict         = params.n_predict;
