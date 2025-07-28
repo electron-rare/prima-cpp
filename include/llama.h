@@ -378,6 +378,9 @@ extern "C" {
         // currently works only with CPU execution
         ggml_abort_callback abort_callback;
         void *              abort_callback_data;
+
+        // Tensor dumping path - if provided, network communication tensors will be dumped
+        const char * dump_folder;
     };
 
     // model quantization parameters

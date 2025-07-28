@@ -356,6 +356,9 @@ struct gpt_params {
 
     // batched-bench params
     bool batched_bench_output_jsonl = false;
+
+    // tensor dumping
+    std::string dump_folder = ""; // folder to dump network communication tensors
 };
 
 // call once at the start of a program if it uses libcommon
