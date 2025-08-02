@@ -381,6 +381,9 @@ extern "C" {
 
         // Tensor dumping path - if provided, network communication tensors will be dumped
         const char * dump_folder;
+
+        // Enable/disable communication and computation logging for gantt chart analysis
+        bool enable_comm_compute_log;
     };
 
     // model quantization parameters

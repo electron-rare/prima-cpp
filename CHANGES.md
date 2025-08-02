@@ -106,9 +106,13 @@ This optimization significantly reduces resource requirements for large model in
 
 ## Communication and Compute Logging
 
-Enable detailed timestamped logging of inter-node communication and computation phases for performance analysis and debugging distributed inference.
+Enable detailed timestamped logging of inter-node communication and computation phases for performance analysis and debugging distributed inference. This feature can be controlled with a CLI flag to reduce overhead when not needed.
 
 - commits (eb0cac1, adad23d, a399e49)
+
+### CLI Control
+
+- `--enable-comm-compute-log`: Enable communication and computation logging (disabled by default for performance)
 
 ### Logging Categories
 

@@ -2067,6 +2067,13 @@ gpt_params_context gpt_params_parser_init(gpt_params & params, llama_example ex,
         }
     ));
     add_opt(llama_arg(
+        {"--enable-comm-compute-log"},
+        "enable communication and computation logging for gantt chart analysis",
+        [](gpt_params & params) {
+            params.enable_comm_compute_log = true;
+        }
+    ));
+    add_opt(llama_arg(
         {"--positive-file"}, "FNAME",
         format("positive prompts file, one prompt per line (default: '%s')", params.cvector_positive_file.c_str()),
         [](gpt_params & params, const std::string & value) {

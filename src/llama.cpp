@@ -2704,6 +2704,7 @@ struct llama_cparams {
     void * cb_eval_user_data;
 
     const char * dump_folder;
+    bool enable_comm_compute_log;
 };
 
 // TODO: separate into "llama_layer_enc" and "llama_layer_dec"
@@ -18582,9 +18583,13 @@ static int llama_decode_internal(
 
             // receive data from other nodes
             if (n_world > 1 && !(my_rank == 0 && i == 0) && !(my_rank == 0 && is_last_l)) {
-                LLAMA_LOG_INFO("[%d][%s][comm][start][recv_tensors][sbatch_tokens: %lu, ubatch_tokens: %u, receive data from other nodes]\n", my_rank, get_iso8601_ms_timestamp().c_str(), lctx.sbatch.n_tokens, ubatch.n_tokens);
+                if (lctx.cparams.enable_comm_compute_log) {
+                    LLAMA_LOG_INFO("[%d][%s][comm][start][recv_tensors][sbatch_tokens: %lu, ubatch_tokens: %u, receive data from other nodes]\n", my_rank, get_iso8601_ms_timestamp().c_str(), lctx.sbatch.n_tokens, ubatch.n_tokens);
+                }
                 llama_recv_tensors(*lctx.recv_socket, &ubatch, is_out_embd, lctx.cparams.dump_folder);
-                LLAMA_LOG_INFO("[%d][%s][comm][end][recv_tensors][sbatch_tokens: %lu, ubatch_tokens: %u, receive data from other nodes]\n", my_rank, get_iso8601_ms_timestamp().c_str(), lctx.sbatch.n_tokens, ubatch.n_tokens);
+                if (lctx.cparams.enable_comm_compute_log) {
+                    LLAMA_LOG_INFO("[%d][%s][comm][end][recv_tensors][sbatch_tokens: %lu, ubatch_tokens: %u, receive data from other nodes]\n", my_rank, get_iso8601_ms_timestamp().c_str(), lctx.sbatch.n_tokens, ubatch.n_tokens);
+                }
             }
 
             // ensure ggml_backend_tensor_get_async of the previous subgraph has finished
@@ -18619,7 +18624,7 @@ static int llama_decode_internal(
                 snprintf(layer_desc, sizeof(layer_desc), "transformer_blocks");
                 log_layer = true;
             }
-            if (log_layer) {
+            if (log_layer && lctx.cparams.enable_comm_compute_log) {
                 LLAMA_LOG_INFO("[%d][%s][compute][start][%s][sbatch_tokens: %lu, ubatch_tokens: %u]\n", my_rank, start_compute_time.c_str(), layer_desc, lctx.sbatch.n_tokens, ubatch.n_tokens);
                 LLAMA_LOG_INFO("[%d][%s][compute][end][%s][sbatch_tokens: %lu, ubatch_tokens: %u]\n", my_rank, end_compute_time.c_str(), layer_desc, lctx.sbatch.n_tokens, ubatch.n_tokens);
             }
@@ -18655,12 +18660,16 @@ static int llama_decode_internal(
 
             // send the result to the next node or the master
             if (!(n_world == 1 || (my_rank == 0 && is_last_l))) {
-                LLAMA_LOG_INFO("[%d][%s][comm][start][send_tensors][sbatch_tokens: %lu, ubatch_tokens: %u, send the result to the next node or the master]\n", my_rank, get_iso8601_ms_timestamp().c_str(), lctx.sbatch.n_tokens, ubatch.n_tokens);
+                if (lctx.cparams.enable_comm_compute_log) {
+                    LLAMA_LOG_INFO("[%d][%s][comm][start][send_tensors][sbatch_tokens: %lu, ubatch_tokens: %u, send the result to the next node or the master]\n", my_rank, get_iso8601_ms_timestamp().c_str(), lctx.sbatch.n_tokens, ubatch.n_tokens);
+                }
                 struct input_tensors tensors = {sub_gf_out, lctx.inp_pos};
                 const bool is_to_master = my_rank != 0 && is_last_l;
                 zmq::socket_t * s = is_to_master ? lctx.master_socket : lctx.send_socket;
                 llama_send_tensors(*s, &ubatch, &tensors, lctx.cparams.dump_folder);
-                LLAMA_LOG_INFO("[%d][%s][comm][end][send_tensors][sbatch_tokens: %lu, ubatch_tokens: %u, send the result to the next node or the master]\n", my_rank, get_iso8601_ms_timestamp().c_str(), lctx.sbatch.n_tokens, ubatch.n_tokens);
+                if (lctx.cparams.enable_comm_compute_log) {
+                    LLAMA_LOG_INFO("[%d][%s][comm][end][send_tensors][sbatch_tokens: %lu, ubatch_tokens: %u, send the result to the next node or the master]\n", my_rank, get_iso8601_ms_timestamp().c_str(), lctx.sbatch.n_tokens, ubatch.n_tokens);
+                }
             }
 
             // overlap memory scheduling with other nodes' communication and computing
@@ -20413,6 +20422,7 @@ struct llama_context_params llama_context_default_params() {
         /*.abort_callback              =*/ nullptr,
         /*.abort_callback_data         =*/ nullptr,
         /*.dump_folder                 =*/ nullptr,
+        /*.enable_comm_compute_log     =*/ false,
     };
 
     return result;
@@ -20924,6 +20934,7 @@ struct llama_context * llama_new_context_with_model(
     ctx->cparams.rank    = params.rank;
     ctx->cparams.force   = params.force;
     ctx->cparams.dump_folder = params.dump_folder;
+    ctx->cparams.enable_comm_compute_log = params.enable_comm_compute_log;
     ctx->cparams.original_next_rank = (params.rank + 1) % params.n_world;
     return ctx;
 }

@@ -2021,6 +2021,8 @@ struct llama_context_params llama_context_params_from_gpt_params(const gpt_param
         cparams.dump_folder = nullptr;
     }
 
+    cparams.enable_comm_compute_log = params.enable_comm_compute_log;
+
     cparams.n_ctx             = params.n_ctx;
     cparams.n_predict         = params.n_predict;
     cparams.n_seq_max         = params.n_parallel;

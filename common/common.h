@@ -359,6 +359,9 @@ struct gpt_params {
 
     // tensor dumping
     std::string dump_folder = ""; // folder to dump network communication tensors
+
+    // communication and computation logging
+    bool enable_comm_compute_log = false; // enable/disable communication and computation logging
 };
 
 // call once at the start of a program if it uses libcommon
