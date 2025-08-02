@@ -404,6 +404,7 @@ static results_perplexity perplexity_v2(llama_context * ctx, const gpt_params & 
 
         // clear the KV cache
         llama_kv_cache_clear(ctx);
+        llama_send_kv_cache_clear(ctx);
 
         for (int j = 0; j < num_batches; ++j) {
             const int batch_start = start + j * n_batch;
@@ -578,6 +579,7 @@ static results_perplexity perplexity(llama_context * ctx, const gpt_params & par
 
         // clear the KV cache
         llama_kv_cache_clear(ctx);
+        llama_send_kv_cache_clear(ctx);
 
         for (int j = 0; j < num_batches; ++j) {
             const int batch_start = start + j * n_batch;
@@ -946,6 +948,7 @@ static void hellaswag_score(llama_context * ctx, const gpt_params & params) {
         }
 
         llama_kv_cache_clear(ctx);
+        llama_send_kv_cache_clear(ctx);
 
         // decode all tasks [i0, i1)
         if (!decode_helper(ctx, batch, batch_logits, n_batch, n_vocab)) {
@@ -1222,6 +1225,7 @@ static void winogrande_score(llama_context * ctx, const gpt_params & params) {
         }
 
         llama_kv_cache_clear(ctx);
+        llama_send_kv_cache_clear(ctx);
 
         // decode all tasks [i0, i1)
         if (!decode_helper(ctx, batch, batch_logits, n_batch, n_vocab)) {
@@ -1591,6 +1595,7 @@ static void multiple_choice_score(llama_context * ctx, const gpt_params & params
         }
 
         llama_kv_cache_clear(ctx);
+        llama_send_kv_cache_clear(ctx);
 
         // decode all tasks [i0, i1)
         if (!decode_helper(ctx, batch, batch_logits, n_batch, n_vocab)) {
@@ -1777,6 +1782,7 @@ static void kl_divergence(llama_context * ctx, const gpt_params & params) {
 
         // clear the KV cache
         llama_kv_cache_clear(ctx);
+        llama_send_kv_cache_clear(ctx);
 
         for (int j = 0; j < num_batches; ++j) {
             const int batch_start = start + j * n_batch;
@@ -1974,6 +1980,21 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
+    uint32_t n_world = params.n_world;
+    uint32_t my_rank = params.rank;
+    GGML_ASSERT(!(n_world == 1 && my_rank > 0));
+    if (my_rank != 0) {
+        // This is a worker node. It should be running the main.cpp logic.
+        // Since this executable is perplexity, we can just print an error and exit,
+        // as the user is expected to launch `main` on worker nodes.
+        // In a perfect world, we'd include the worker loop here, but the prompt
+        // simplifies this by saying workers always run main.cpp.
+        // We will proceed assuming my_rank is 0, as per the request.
+        LOG_ERR("perplexity executable is designed to run only on the master node (rank 0).\n");
+        LOG_ERR("Worker nodes (rank > 0) should run the 'main' executable.\n");
+        return 1;
+    }
+
     const bool ppl = !params.hellaswag && !params.winogrande && !params.multiple_choice && !params.kl_divergence;
 
     if (ppl) {
@@ -2043,6 +2064,9 @@ int main(int argc, char ** argv) {
     llama_perf_context_print(ctx);
 
     write_logfile(ctx, params, model, results);
+
+    char * stop_signal = nullptr;
+    llama_free_sockets(ctx, &stop_signal);
 
     llama_free(ctx);
     llama_free_model(model);

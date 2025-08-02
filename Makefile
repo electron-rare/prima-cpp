@@ -1,5 +1,6 @@
 # Define the default target now so that it is always the first target
 BUILD_TARGETS = \
+	llama-perplexity \
 	llama-server \
 	llama-cli \
 	profile-tool
