@@ -33,6 +33,8 @@ struct llama_lora_adapter_container : llama_lora_adapter_info {
     struct llama_lora_adapter * adapter;
 };
 
+using llama_tokens = std::vector<llama_token>;
+
 // build info
 extern int LLAMA_BUILD_NUMBER;
 extern char const * LLAMA_COMMIT;
@@ -141,12 +143,26 @@ struct gpt_sampler_params {
     std::string print() const;
 };
 
+struct common_params_speculative {
+    int32_t n_ctx        =     0; // draft context size
+    int32_t n_max        =    16; // maximum number of tokens to draft during speculative decoding
+    int32_t n_min        =     5; // minimum number of draft tokens to use for speculative decoding
+    int32_t n_gpu_layers =    -1; // number of layers to store in VRAM for the draft model (-1 - use default)
+    float   p_split      =  0.1f; // speculative decoding split probability
+    float   p_min        =  0.9f; // minimum speculative decoding probability (greedy)
+
+    struct cpu_params cpuparams;
+    struct cpu_params cpuparams_batch;
+
+    std::string model = ""; // draft model for speculative decoding                          // NOLINT
+};
+
 struct gpt_params {
     int32_t n_world               =     1; // number of devices to use
     int32_t rank                  =     0; // my rank for distributed inference
     uint32_t n_layer_window[32]   =   {0}; // layer window size on each node
-    std::string master_ip         = "localhost"; // ip address of the master node
-    std::string next_node_ip      = "localhost"; // ip address of my next node
+    std::string master_ip         = "127.0.0.1"; // ip address of the master node
+    std::string next_node_ip      = "127.0.0.1"; // ip address of my next node
     uint32_t    data_port         = 9000;      // base data port for this node
     uint32_t    signal_port       = 10000;     // base signal port for this node
     uint32_t    master_data_port      = 9000;  // data port base for master node
@@ -154,7 +170,9 @@ struct gpt_params {
     uint32_t    next_node_signal_port = 10000; // signal port base for next node
     bool    prefetch              = false; // prefetch layer weights
     bool    keep_out_in_metal     =  true; // whether to keep output weights in metal memory, true by default
+    bool    keep_out_in_cuda      = false; // whether to run the output layer on CUDA, false by default
     bool    force                 = false; // force to start prefetching after computation
+    float   master_priority       =  1.01; // priority to assign workload to the master (set 1.01 to use master first, and 0.99 to offload to other devices)
     int32_t gpu_mem               = 999.0; // gpu memory to use, in GiB
     int32_t n_cycles              =     0; // number of cycles to output one token
     int32_t n_predict             =    -1; // new tokens to predict
@@ -162,7 +180,6 @@ struct gpt_params {
     int32_t n_batch               =  2048; // logical batch size for prompt processing (must be >=32 to use BLAS)
     int32_t n_ubatch              =   512; // physical batch size for prompt processing (must be >=32 to use BLAS)
     int32_t n_keep                =     0; // number of tokens to keep from initial prompt
-    int32_t n_draft               =     5; // number of tokens to draft during speculative decoding
     int32_t n_chunks              =    -1; // max number of chunks to process (-1 = unlimited)
     int32_t n_parallel            =     1; // number of parallel sequences to decode
     int32_t n_sequences           =     1; // number of sequences to decode
@@ -199,9 +216,9 @@ struct gpt_params {
     enum llama_attention_type    attention_type    = LLAMA_ATTENTION_TYPE_UNSPECIFIED; // attention type for embeddings
 
     struct gpt_sampler_params sparams;
+    struct common_params_speculative speculative;
 
     std::string model                = ""; // model path                                                    // NOLINT
-    std::string model_draft          = ""; // draft model for speculative decoding                          // NOLINT
     std::string model_alias          = "unknown"; // model alias                                            // NOLINT
     std::string model_url            = ""; // model url to download                                         // NOLINT
     std::string hf_token             = ""; // HF token                                                      // NOLINT

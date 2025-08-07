@@ -627,12 +627,19 @@ gpt_params_context gpt_params_parser_init(gpt_params & params, llama_example ex,
         }
     ).set_examples({LLAMA_EXAMPLE_SPECULATIVE}));
     add_opt(llama_arg(
-        {"--draft"}, "N",
-        format("number of tokens to draft for speculative decoding (default: %d)", params.n_draft),
+        {"--draft-max", "--draft", "--draft-n"}, "N",
+        format("number of tokens to draft for speculative decoding (default: %d)", params.speculative.n_max),
         [](gpt_params & params, int value) {
-            params.n_draft = value;
+            params.speculative.n_max = value;
         }
-    ).set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_LOOKUP}));
+    ).set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_LOOKUP, LLAMA_EXAMPLE_SERVER}));
+    add_opt(llama_arg(
+        {"--draft-min", "--draft-n-min"}, "N",
+        format("minimum number of draft tokens to use for speculative decoding (default: %d)", params.speculative.n_min),
+        [](gpt_params & params, int value) {
+            params.speculative.n_min = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_LOOKUP, LLAMA_EXAMPLE_SERVER}));
     add_opt(llama_arg(
         {"-ps", "--p-split"}, "N",
         format("speculative decoding split probability (default: %.1f)", (double)params.p_split),
@@ -640,6 +647,13 @@ gpt_params_context gpt_params_parser_init(gpt_params & params, llama_example ex,
             params.p_split = std::stof(value);
         }
     ).set_examples({LLAMA_EXAMPLE_SPECULATIVE}));
+    add_opt(llama_arg(
+        {"--draft-p-min"}, "P",
+        format("minimum speculative decoding probability (greedy) (default: %.1f)", (double)params.speculative.p_min),
+        [](gpt_params & params, const std::string & value) {
+            params.speculative.p_min = std::stof(value);
+        }
+    ).set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER}));
     add_opt(llama_arg(
         {"-lcs", "--lookup-cache-static"}, "FNAME",
         "path to static lookup cache to use for lookup decoding (not updated by generation)",
@@ -659,6 +673,7 @@ gpt_params_context gpt_params_parser_init(gpt_params & params, llama_example ex,
         format("size of the prompt context (default: %d, 0 = loaded from model)", params.n_ctx),
         [](gpt_params & params, int value) {
             params.n_ctx = value;
+            params.speculative.n_ctx = value;
         }
     ).set_env("LLAMA_ARG_CTX_SIZE"));
     add_opt(llama_arg(
@@ -770,6 +785,9 @@ gpt_params_context gpt_params_parser_init(gpt_params & params, llama_example ex,
         format("maximum GPU memory to use (default: %d)", params.gpu_mem),
         [](gpt_params & params, int value) {
             params.gpu_mem = value; // in GiB
+            if (value == 0) {
+                LOG_WRN("WARN: Set --gpu-mem to 0 may lead to errors during workload distribution.\n");
+            }
         }
     ).set_env("LLAMA_ARG_CUDA_MEM"));
     add_opt(llama_arg(
@@ -786,6 +804,14 @@ gpt_params_context gpt_params_parser_init(gpt_params & params, llama_example ex,
             params.force = true;
         }
     ).set_env("LLAMA_ARG_FORCE"));
+    add_opt(llama_arg(
+        {"--master-priority"}, "N",
+        format("priority to assign workload to the master (default: %f, set 1.01 to use master first, and 0.99 to offload to other devices)", params.master_priority),
+        [](gpt_params & params, const std::string & value) {
+            params.master_priority = std::stof(value);
+        }
+    ).set_env("LLAMA_ARG_MASTER_PRIORITY"));
+
 // #ifdef GGML_USE_METAL
 //     // warn: if the output layer weights are not kept in metal shared memory, its mmap-ed weight data
 //     // could be released by the OS and reloaded repeatedly, which causes additional disk I/O latency.
@@ -798,6 +824,17 @@ gpt_params_context gpt_params_parser_init(gpt_params & params, llama_example ex,
 //         }
 //     ).set_env("LLAMA_ARG_KEEP_INP_OUT_IN_METAL"));
 // #endif
+
+#ifdef GGML_USE_CUDA
+    add_opt(llama_arg(
+        {"--keep-out-in-cuda"},
+        format("whether to compute the output layer on CUDA (default: %s)", params.keep_out_in_cuda ? "true" : "false"),
+        [](gpt_params & params) {
+            params.keep_out_in_cuda = true;
+        }
+    ).set_env("LLAMA_ARG_KEEP_INP_OUT_IN_CUDA"));
+#endif
+
     add_opt(llama_arg(
         {"-n", "--predict", "--n-predict"}, "N",
         format("number of tokens to predict (default: %d, -1 = infinity, -2 = until context filled)", params.n_predict),
@@ -1561,13 +1598,14 @@ gpt_params_context gpt_params_parser_init(gpt_params & params, llama_example ex,
         {"-ngld", "--gpu-layers-draft", "--n-gpu-layers-draft"}, "N",
         "number of layers to store in VRAM for the draft model",
         [](gpt_params & params, int value) {
-            params.n_gpu_layers_draft = value;
+            params.n_gpu_layers_draft = value; // TODO: remove
+            params.speculative.n_gpu_layers = value;
             if (!llama_supports_gpu_offload()) {
                 fprintf(stderr, "warning: not compiled with GPU offload support, --gpu-layers-draft option will be ignored\n");
                 fprintf(stderr, "warning: see main README.md for information on enabling GPU BLAS support\n");
             }
         }
-    ).set_examples({LLAMA_EXAMPLE_SPECULATIVE}));
+    ).set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER}));
     add_opt(llama_arg(
         {"-sm", "--split-mode"}, "{none,layer,row}",
         "how to split the model across multiple GPUs, one of:\n"
@@ -1710,9 +1748,9 @@ gpt_params_context gpt_params_parser_init(gpt_params & params, llama_example ex,
         {"-md", "--model-draft"}, "FNAME",
         "draft model for speculative decoding (default: unused)",
         [](gpt_params & params, const std::string & value) {
-            params.model_draft = value;
+            params.speculative.model = value;
         }
-    ).set_examples({LLAMA_EXAMPLE_SPECULATIVE}));
+    ).set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER}));
     add_opt(llama_arg(
         {"-mu", "--model-url"}, "MODEL_URL",
         "model download url (default: unused)",
@@ -2027,6 +2065,13 @@ gpt_params_context gpt_params_parser_init(gpt_params & params, llama_example ex,
             params.chat_template = value;
         }
     ).set_examples({LLAMA_EXAMPLE_MAIN, LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_CHAT_TEMPLATE"));
+    add_opt(llama_arg(
+        {"-sys", "--system-prompt"}, "PROMPT",
+        "system prompt to use with model (if applicable, depending on chat template)",
+        [](gpt_params & params, const std::string & value) {
+            params.system_prompt = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_MAIN, LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_SYSTEM_PROMPT"));
     add_opt(llama_arg(
         {"-sps", "--slot-prompt-similarity"}, "SIMILARITY",
         format("how much the prompt of a request must match the prompt of a slot in order to use that slot (default: %.2f, 0.0 = disabled)\n", params.slot_prompt_similarity),

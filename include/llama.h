@@ -67,6 +67,16 @@ extern "C" {
     typedef int32_t llama_token;
     typedef int32_t llama_seq_id;
 
+    enum backend_type {
+        BACKEND_CPU     = 0,
+        BACKEND_CUDA    = 1,
+        BACKEND_METAL   = 2,
+        BACKEND_VULKAN  = 3,
+        BACKEND_KOMPUTE = 4,
+        BACKEND_GPUBLAS = 5,
+        BACKEND_SYCL    = 6
+    };
+
     enum llama_vocab_type {
         LLAMA_VOCAB_TYPE_NONE = 0, // For models without vocab
         LLAMA_VOCAB_TYPE_SPM  = 1, // LLaMA tokenizer based on byte-level BPE with byte fallback
@@ -317,6 +327,7 @@ extern "C" {
         bool use_mlock;     // force system to keep model in RAM
         bool check_tensors; // validate model tensor data
         bool keep_out_in_metal; // whether to keep output weights in metal memory
+        bool keep_out_in_cuda;  // whether to run the output layer on CUDA
     };
 
     // NOTE: changing the default values of parameters marked as [EXPERIMENTAL] may cause crashes or incorrect results in certain configurations
@@ -329,7 +340,9 @@ extern "C" {
         uint32_t    n_cycles;          // number of cycles to output one token
         bool        prefetch;          // whether to prefetch layer weights
         bool        force;             // force to start prefetching after computation
+        float       master_priority;   // priority to assign workload to the master (set 1.01 to use master first, and 0.99 to offload to other devices)
         bool        keep_out_in_metal; // whether to keep output weights in metal memory
+        bool        keep_out_in_cuda;  // whether to run the output layer on CUDA
         char *      master_ip;         // ip address of the master node
         char *      next_node_ip;      // ip address of the next node
         uint32_t    data_port;         // base data port for this node
@@ -461,6 +474,12 @@ extern "C" {
               struct llama_model_params   params);
 
     LLAMA_API void llama_free_model(struct llama_model * model);
+    
+    enum NodeType{
+        NODE_TYPE_WORKER,
+        NODE_TYPE_FORWARDER,
+        NODE_TYPE_EXIT,
+    };
 
     LLAMA_API void llama_init_sockets      (struct llama_context * ctx, uint32_t n_world, uint32_t my_rank);
     LLAMA_API void llama_free_sockets      (struct llama_context * ctx, char ** msg);
@@ -468,7 +487,12 @@ extern "C" {
     LLAMA_API int  llama_send_device_info  (struct llama_context * ctx, struct device_info * dev_info);
     LLAMA_API int  llama_bcast_startup_args(struct llama_context * ctx, uint32_t rank, struct startup_args * args);
     LLAMA_API int  llama_bcast_layer_setup (struct llama_context * ctx, uint32_t * n_layer_window, uint32_t * n_gpu_layers);
-    LLAMA_API int  llama_rebuild_topo      (struct llama_context * ctx, uint32_t * n_layer_window, struct device_info * dev_info_set);
+    LLAMA_API int  llama_rebuild_topo      (struct llama_context * ctx, 
+                                                        uint32_t * n_layer_window, 
+                                              struct device_info * desv_info_set, 
+                                                         NodeType* node_type,
+                                                         char    * is_forwarder);
+    LLAMA_API int  llama_forward_messages   (struct llama_context * ctx);
     LLAMA_API int  llama_recv_layer_setup  (struct llama_context * ctx, uint32_t * n_layer_window, uint32_t * n_gpu_layers);
 
     LLAMA_API int llm_load_tensors(
@@ -479,7 +503,9 @@ extern "C" {
     LLAMA_API void llama_update_context_with_rankworld(
                    struct llama_context * ctx, 
                                uint32_t   rank, 
-                               uint32_t   n_world);
+                               uint32_t   n_world,
+                               uint32_t   worker_rank,
+                               uint32_t   n_worker);
     
     LLAMA_API struct llama_context * llama_new_context_with_model(
                      struct llama_model * model,
@@ -571,10 +597,11 @@ extern "C" {
                                    int64_t * gpu_buf,
                   const struct llama_model * model, 
          const struct llama_context_params   cparams, 
-                                      bool   use_gpu,
-                                      bool   is_master,
-                                       int   n_layers,
-                                       int   n_gpu_layers);
+                         enum backend_type   backend,
+                                       int   my_rank,
+                        struct model_bytes   n_bytes,
+                                      bool   offload,
+                                      bool   has_gpu_layers);
 
     // Return the size of KV cache in the model
     LLAMA_API void llama_total_kv_size(
@@ -770,6 +797,11 @@ extern "C" {
 
     // Removes all tokens that do not belong to the specified sequence
     LLAMA_API void llama_kv_cache_seq_keep(
+            struct llama_context * ctx,
+                    llama_seq_id   seq_id);
+    
+    // Notify other nodes to keep only the specified sequence in their KV cache
+    LLAMA_API void llama_send_kv_cache_seq_keep(
             struct llama_context * ctx,
                     llama_seq_id   seq_id);
 
@@ -970,7 +1002,8 @@ extern "C" {
     // < 0 - error
     LLAMA_API int32_t llama_decode(
             struct llama_context * ctx,
-              struct llama_batch   batch);
+              struct llama_batch   batch,
+                            bool   server_mode = false);
 
     // Set the number of threads used for decoding
     // n_threads is the number of threads used for generation (single token)

@@ -28,6 +28,7 @@
 #include <unordered_set>
 #include <vector>
 #include <thread>
+#include <atomic>
 
 #if defined(__APPLE__) && defined(__MACH__)
 #include <sys/types.h>
@@ -846,6 +847,16 @@ static std::string vec_to_str(const std::vector<T> & vec) {
     return oss.str();
 }
 
+static backend_type get_backend_type(const gpu_support & support) {
+    if (support.cuda)    return BACKEND_CUDA;
+    if (support.metal)   return BACKEND_METAL;
+    if (support.vulkan)  return BACKEND_VULKAN;
+    if (support.kompute) return BACKEND_KOMPUTE;
+    if (support.gpublas) return BACKEND_GPUBLAS;
+    if (support.sycl)    return BACKEND_SYCL;
+    return BACKEND_CPU;
+}
+
 static bool assign_layers_to_device(
                                 uint32_t   n_world,
                        const device_info * dev_info_set, 
@@ -971,11 +982,11 @@ static bool assign_layers_to_device(
         bool is_android = strcmp(dev.device_os, "Android") == 0;
         bool is_windows = strcmp(dev.device_os, "Windows") == 0;
         GGML_ASSERT(!is_windows && "Windows is not tested yet\n");
-        
+
         if ((is_macos && !dev.gpu_support.metal) || is_linux) {
             mem_budget[m] = dev.memory.available_physical;
         } else if (is_macos && dev.gpu_support.metal) {
-            mem_budget[m] = dev.gpu_props.memory_free;
+            mem_budget[m] = dev.gpu_props.memory_free + 1e-4; // to avoid division by zero
         } else if (is_android) {
             mem_budget[m] = dev.memory.available_physical + dev.memory.used_can_swap;
         } else {
@@ -984,17 +995,35 @@ static bool assign_layers_to_device(
         }
     }
 
-    // initialize w_m proportionally to memory budget and n_m to 0
+    // initialize w_m proportionally to memory budget
     float total_mem_budget = std::accumulate(mem_budget.begin(), mem_budget.end(), 0.0f);
     for (uint32_t m = 0; m < n_world; ++m) {
         w[m] = std::round(mem_budget[m] / total_mem_budget * n_layer);
-        n[m] = 0;
+    }
+    // no 0 is allowed in w, it must be at least 1
+    for (uint32_t m = 0; m < n_world; ++m) {
+        if (w[m] == 0) {
+            w[m] = 1;
+            // find the maximum and decrease it by 1
+            auto max_it = std::max_element(w.begin(), w.end());
+            if (max_it != w.end() && *max_it > 1) {
+                *max_it -= 1;
+            }
+        }
     }
     // adjust w[m] to ensure L mod W = 0
     int diff = n_layer - std::accumulate(w.begin(), w.end(), 0);
     auto device = (diff > 0) ? std::max_element(mem_budget.begin(), mem_budget.end()) 
                              : std::min_element(mem_budget.begin(), mem_budget.end());
     w[std::distance(mem_budget.begin(), device)] += diff;
+    // initialize n_m to w_m (if there is GPU), assume all layers can run on GPU
+    for (uint32_t m = 0; m < n_world; ++m) {
+        if (dev_info_set[m].gpu_support.metal || dev_info_set[m].gpu_support.cuda) {
+            n[m] = w[m];
+        } else {
+            n[m] = 0;
+        }
+    }
 
     // stores the actual read bandwidth (GB/s) for each device
     std::vector<float> disk_speed(n_world, 0.0f);
@@ -1051,8 +1080,7 @@ static bool assign_layers_to_device(
             bool is_windows = strcmp(dev.device_os, "Windows") == 0;
             GGML_ASSERT(!is_windows && "Windows is not tested yet\n");
 
-            bool use_gpu = dev.gpu_support.metal || dev.gpu_support.cuda;
-            llama_model_compute_buf_size(&c_cpu[m], &c_gpu[m], model, cparams, use_gpu, m == 0, w[m] * k, n[m] * k);
+            llama_model_compute_buf_size(&c_cpu[m], &c_gpu[m], model, cparams, get_backend_type(dev.gpu_support), m, dev_info_set[0].model_bytes, w[m] > n[m], n[m] > 0);
 
             int  l_m          = w[m] * k;  // total number of layers assigned to device m
             int  l_m_gpu      = n[m] * k;  // number of layers assigned to device m that run on GPU
@@ -1213,6 +1241,7 @@ static bool assign_layers_to_device(
                 if (dev.gpu_support.metal && m == 0 && cparams.keep_out_in_metal) {
                     vec_z_gpu[m] -= (double)bo / (double)(n_layer * b_prime);
                 }
+                vec_z_gpu[m] = std::max(vec_z_gpu[m], 0.0f);
             }
         }
 
@@ -1247,6 +1276,8 @@ static bool assign_layers_to_device(
                     return cost * k;
                 }
             );
+            // apply priority to the head device
+            model.lp_.col_cost_[0] *= 1.0 / cparams.master_priority;
 
             // define the variable bounds
             model.lp_.col_lower_ = std::vector<double>(n_world * 2, 0.0);
@@ -1412,26 +1443,37 @@ static bool assign_layers_to_device(
         }
 
         // check the solution
-        bool has_free_gpu_memory = false, has_gpu_overload = false, has_cpu_overload = false;
+        bool has_free_gpu_memory = false, has_gpu_overload = false, has_cpu_overload = false, has_weak_device = false;
         for (uint32_t m = 0; m < n_world; ++m) {
             // if (!dev_gpu[m]) continue;
             uint32_t w_m = best_solution[m], n_m = best_solution[m + n_world];
+
+            if (w_m == 1 && n_m == 0) {
+                // if the device is weak
+                has_weak_device = true;
+                LOG_INF("Device %d is weak, need to be removed: w_m = %d, n_m = %d\n", m, w_m, n_m);
+            }
 
             if (dev_gpu[m]) {
                 if (n_m < static_cast<uint32_t>(std::floor(W * vec_z_gpu[m]))) {
                     // if there is still free GPU memory
                     has_free_gpu_memory = true;
-                } else if (w_m > n_m) {
-                    // if the GPU is overloaded
+                    LOG_INF("Device %d still has free GPU memory: w_m = %d, n_m = %d, W * vec_z_gpu[m]) = %d\n", 
+                        m, w_m, n_m, static_cast<uint32_t>(std::floor(W * vec_z_gpu[m])));
+                }
+                if (w_m > n_m) {
+                    // if layers are offloaded to CPU
                     has_gpu_overload = true;
+                    LOG_INF("Device %d has GPU overload: w_m = %d, n_m = %d\n", m, w_m, n_m);
                 }
             } else if (!in_set(m, M4)) {
                 // if the CPU is overloaded
                 has_cpu_overload = true;
+                LOG_INF("Device %d has CPU overload.\n", m);
             }
         }
 
-        if (has_free_gpu_memory && (has_gpu_overload || has_cpu_overload)) {
+        if (!has_weak_device && has_free_gpu_memory && (has_gpu_overload || has_cpu_overload)) {
             int worst_device = -1;
             float worst_speed = std::numeric_limits<float>::max();
 
@@ -1503,13 +1545,24 @@ static bool assign_layers_to_device(
     float total_mem_budget = std::accumulate(mem_budget.begin(), mem_budget.end(), 0.0f);
     for (uint32_t m = 0; m < n_world; ++m) {
         w[m] = std::round(mem_budget[m] / total_mem_budget * n_layer);
-        n[m] = 0;
+    }
+    // no 0 is allowed in w, it must be at least 1
+    for (uint32_t m = 0; m < n_world; ++m) {
+        if (w[m] == 0) {
+            w[m] = 1;
+            // find the maximum and decrease it by 1
+            auto max_it = std::max_element(w.begin(), w.end());
+            if (max_it != w.end() && *max_it > 1) {
+                *max_it -= 1;
+            }
+        }
     }
     // adjust w[m] to ensure L mod W = 0
     int diff = n_layer - std::accumulate(w.begin(), w.end(), 0);
     auto device = (diff > 0) ? std::max_element(mem_budget.begin(), mem_budget.end()) 
                             : std::min_element(mem_budget.begin(), mem_budget.end());
     w[std::distance(mem_budget.begin(), device)] += diff;
+
     std::copy(w.begin(), w.end(), n_layer_window);
 
     std::vector<float> vec_z_gpu(n_world, 0.0f);
@@ -1517,8 +1570,7 @@ static bool assign_layers_to_device(
 
     for (uint32_t m = 0; m < n_world; ++m) {
         const device_info & dev = dev_info_set[m];
-        bool use_gpu = dev.gpu_support.metal || dev.gpu_support.cuda;
-        llama_model_compute_buf_size(&c_cpu[m], &c_gpu[m], model, cparams, use_gpu, m == 0, w[m], n[m]);
+        llama_model_compute_buf_size(&c_cpu[m], &c_gpu[m], model, cparams, get_backend_type(dev.gpu_support), m, dev_info_set[0].model_bytes, false, true);
 
         if (dev.gpu_support.cuda || dev.gpu_support.metal) {
             int64_t required_mem = w[m] * b_prime;
@@ -1676,6 +1728,7 @@ struct llama_init_result llama_init_from_gpt_params(gpt_params & params) {
         cparams.n_layer_window[0] = n_layers;
         mparams.n_layer_window[0] = n_layers;
         llama_context_n_layer_window(lctx)[0] = n_layers;
+        llama_update_context_with_rankworld(lctx, 0, 1, 0, 1);
 
 #if defined(GGML_USE_METAL) || defined(GGML_USE_CUDA)
         params.n_gpu_layers = std::min((int32_t)n_layers, params.n_gpu_layers);
@@ -1717,13 +1770,15 @@ struct llama_init_result llama_init_from_gpt_params(gpt_params & params) {
         }
 
         // sychronize device profile to the master node
+        NodeType node_type = NodeType::NODE_TYPE_WORKER;
+        char is_forwarder[32] = {0};
         if (my_rank == 0) {
             if (auto_schedule) {
                 std::vector<device_info> dev_info_set(n_world);
                 dev_info_set[0] = dev_info;
 
                 llama_gather_device_info(lctx, dev_info_set.data());
-                device_print_props(dev_info_set.data(), n_world, model, cparams);
+                device_print_props      (dev_info_set.data(), n_world, model, cparams);
 
                 // assign layers to devices and remove weak devices
                 if (!assign_layers_and_select_devices(n_world, dev_info_set, n_layer_window, n_gpu_layers, model, cparams)) {
@@ -1733,7 +1788,7 @@ struct llama_init_result llama_init_from_gpt_params(gpt_params & params) {
                     return iparams;
                 }
                 llama_bcast_layer_setup(lctx, n_layer_window, n_gpu_layers);
-                llama_rebuild_topo(lctx, n_layer_window, dev_info_set.data());
+                llama_rebuild_topo     (lctx, n_layer_window, dev_info_set.data(), &node_type, is_forwarder);
             } else {
                 // use the user-defined n_layer_window
                 std::copy(std::begin(params.n_layer_window), std::end(params.n_layer_window), n_layer_window);
@@ -1741,16 +1796,16 @@ struct llama_init_result llama_init_from_gpt_params(gpt_params & params) {
             }
         } else {
             if (auto_schedule){
-                llama_send_device_info(lctx, &dev_info);
-                llama_recv_layer_setup(lctx, n_layer_window, n_gpu_layers);
-                llama_rebuild_topo    (lctx, n_layer_window, nullptr);
+                llama_send_device_info (lctx, &dev_info);
+                llama_recv_layer_setup (lctx, n_layer_window, n_gpu_layers);
+                llama_rebuild_topo     (lctx, n_layer_window, nullptr, &node_type, is_forwarder);
             } else {
-                llama_recv_layer_setup(lctx, n_layer_window, n_gpu_layers);
+                llama_recv_layer_setup (lctx, n_layer_window, n_gpu_layers);
             }
         }
 
         // if this is a weak device, then exit
-        if (n_layer_window[my_rank] <= 0) {
+        if (node_type == NodeType::NODE_TYPE_EXIT) {
             LOG_INF("No layer is assigned to me, exit.\n");
             llama_free(lctx);
             llama_free_model(model);
@@ -1759,18 +1814,22 @@ struct llama_init_result llama_init_from_gpt_params(gpt_params & params) {
 
         // update my rank and n_world
         uint32_t update_rank = 0, update_n_world = 1;
+        uint32_t worker_rank = 0, n_worker       = 1;
         std::vector<uint32_t> n_layer_window_temp = {n_layer_window[0]}, n_gpu_layers_temp = {n_gpu_layers[0]};
 
         for (uint32_t i = 1; i < n_world; i++) {
-            if (n_layer_window[i] <= 0) {
+            if (n_layer_window[i] <= 0 && is_forwarder[i] == 0) {
                 continue;
             }
-            if (i <= my_rank) {
-                update_rank++;
-            }
+            if (i <= my_rank) update_rank++;
             update_n_world++;
             n_layer_window_temp.push_back(n_layer_window[i]);
             n_gpu_layers_temp.push_back(n_gpu_layers[i]);
+
+            if (n_layer_window[i] > 0) {
+                if (i <= my_rank) worker_rank++;
+                n_worker++;
+            }
         }
 
         memset(n_layer_window, 0, n_world * sizeof(uint32_t));
@@ -1793,8 +1852,26 @@ struct llama_init_result llama_init_from_gpt_params(gpt_params & params) {
         params.n_world  = update_n_world;
         n_world         = update_n_world;
 
-        llama_update_context_with_rankworld(lctx, update_rank, update_n_world);
-        
+        llama_update_context_with_rankworld(lctx, update_rank, update_n_world, worker_rank, n_worker);
+
+        if (node_type == NodeType::NODE_TYPE_FORWARDER) {
+            //just forward
+            LOG_INF("No layer is assigned to me, and I serve as a network proxy.\n");
+            std::atomic<bool> should_exit{false};
+            auto t = std::thread([lctx, &should_exit]() {
+                while(!should_exit) {
+                    llama_forward_messages(lctx);
+                }
+            });
+            char * stop_signal = nullptr;
+            llama_free_sockets(lctx, &stop_signal); // this will block until receive stop signal
+
+            should_exit = true;
+            t.join();
+
+            exit(0);
+        }
+
         // update n_layer_window and n_gpu_layers
         std::copy(std::begin(n_layer_window), std::end(n_layer_window), params.n_layer_window);
         std::copy(std::begin(n_layer_window), std::end(n_layer_window), cparams.n_layer_window);
@@ -1940,17 +2017,20 @@ struct llama_model_params llama_model_params_from_gpt_params(const gpt_params & 
     if (params.n_gpu_layers != -1) {
         mparams.n_gpu_layers = params.n_gpu_layers;
     }
-    mparams.n_world         = params.n_world;
-    mparams.rank            = params.rank;
-    mparams.rpc_servers     = params.rpc_servers.c_str();
+
+    mparams.n_world           = params.n_world;
+    mparams.rank              = params.rank;
+    mparams.rpc_servers       = params.rpc_servers.c_str();
     mparams.gguf_splits     = params.gguf_splits.c_str();
-    mparams.main_gpu        = params.main_gpu;
-    mparams.split_mode      = params.split_mode;
-    mparams.tensor_split    = params.tensor_split;
-    mparams.use_mmap        = params.use_mmap;
-    mparams.use_mlock       = params.use_mlock;
-    mparams.check_tensors   = params.check_tensors;
+    mparams.main_gpu          = params.main_gpu;
+    mparams.split_mode        = params.split_mode;
+    mparams.tensor_split      = params.tensor_split;
+    mparams.use_mmap          = params.use_mmap;
+    mparams.use_mlock         = params.use_mlock;
+    mparams.check_tensors     = params.check_tensors;
     mparams.keep_out_in_metal = params.keep_out_in_metal;
+    mparams.keep_out_in_cuda  = params.keep_out_in_cuda;
+
     std::copy(std::begin(params.n_layer_window), std::end(params.n_layer_window), mparams.n_layer_window);
     if (params.kv_overrides.empty()) {
         mparams.kv_overrides = NULL;
@@ -1990,7 +2070,9 @@ struct llama_context_params llama_context_params_from_gpt_params(const gpt_param
     cparams.rank              = params.rank;
     cparams.prefetch          = params.prefetch;
     cparams.force             = params.force;
+    cparams.master_priority   = params.master_priority;
     cparams.keep_out_in_metal = params.keep_out_in_metal;
+    cparams.keep_out_in_cuda  = params.keep_out_in_cuda;
     cparams.n_gpu_layers      = params.n_gpu_layers;
     cparams.n_cycles          = params.n_cycles;
     std::copy(std::begin(params.n_layer_window), std::end(params.n_layer_window), cparams.n_layer_window);
@@ -3044,7 +3126,7 @@ void yaml_dump_non_result_info(FILE * stream, const gpt_params & params, const l
     fprintf(stream, "mirostat_lr: %f # default: 0.1\n", sparams.mirostat_eta);
     fprintf(stream, "mlock: %s # default: false\n", params.use_mlock ? "true" : "false");
     fprintf(stream, "model: %s # default: %s\n", params.model.c_str(), DEFAULT_MODEL_PATH);
-    fprintf(stream, "model_draft: %s # default:\n", params.model_draft.c_str());
+    fprintf(stream, "model_draft: %s # default:\n", params.speculative.model.c_str());
     fprintf(stream, "multiline_input: %s # default: false\n", params.multiline_input ? "true" : "false");
     fprintf(stream, "n_gpu_layers: %d # default: -1\n", params.n_gpu_layers);
     fprintf(stream, "n_predict: %d # default: -1 (unlimited)\n", params.n_predict);

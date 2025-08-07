@@ -924,7 +924,7 @@ static void check_env_path() {
     setenv("PATH", update_env_path.c_str(), 1);
 }
 
-static void external_fio_impl(float * read_bw, float * write_bw, bool op_rand, int n_threads) {
+static void external_fio_impl(float * read_bw, float * write_bw, bool op_rand, int n_threads) {    
     pid_t pid = getpid(); // avoid conflict with other processes
 
     std::string test_file   = "fio_test_"   + std::to_string(pid);
@@ -1603,10 +1603,20 @@ static float device_disk_access_delay(struct device_info & dev_info, struct llam
 
 #if defined(GGML_USE_METAL) || defined(GGML_USE_CUDA)
     llama_kv_size(&cpu_kv_size, &gpu_kv_size, model, cparams, true);
-    llama_model_compute_buf_size(&cpu_compute_buf, &gpu_compute_buf, model, cparams, true,  true, n_layers, n_gpu_layers);
+
+    enum backend_type backend;
+#if GGML_USE_METAL
+    backend = BACKEND_METAL;
+#elif GGML_USE_CUDA
+    backend = BACKEND_CUDA;
+#endif
+    llama_model_compute_buf_size(&cpu_compute_buf, &gpu_compute_buf, model, cparams, backend, 0, n_bytes, n_layers > n_gpu_layers, n_gpu_layers > 0);
+
 #else
     llama_kv_size(&cpu_kv_size, &gpu_kv_size, model, cparams, false);
-    llama_model_compute_buf_size(&cpu_compute_buf, &gpu_compute_buf, model, cparams, false, true, n_layers, n_gpu_layers);
+
+    enum backend_type backend = BACKEND_CPU;
+    llama_model_compute_buf_size(&cpu_compute_buf, &gpu_compute_buf, model, cparams, backend, 0, n_bytes, n_layers > n_gpu_layers, n_gpu_layers > 0);
 #endif
 
     double cpu_kv_size_gib     = static_cast<double>(cpu_kv_size) / 1024.0 / 1024.0 / 1024.0;     // convert to GiB
@@ -2621,7 +2631,7 @@ size_t serialize(const struct device_info * dev_info, char ** buffer) {
     return total_size;
 }
 
-void deserialize(const char * buffer, struct device_info * dev_info) {
+size_t deserialize(const char * buffer, struct device_info * dev_info) {
     const char * ptr = buffer;
 
     // rank
@@ -2821,6 +2831,34 @@ void deserialize(const char * buffer, struct device_info * dev_info) {
     ptr += sizeof(float);
 
     memcpy(&dev_info->gpu_props.cuda_mem_cpy_delay, ptr, sizeof(float));
+    ptr += sizeof(float);
 
     // no need to synchronize model flops and model params
+    return ptr - buffer;
+}
+
+void TopoRebuildHelperInfo::deserialize(const char * buffer) {
+    size_t buffer_size = ::deserialize(buffer, &dev_info);
+    if (buffer_size == 0) {
+        LOG_ERR("%s: failed to deserialize device info\n", __func__);
+        return;
+    }
+    memcpy(&is_forwarder, buffer + buffer_size, 1);
+}
+
+size_t TopoRebuildHelperInfo::serialize(char ** buffer) const{ 
+    size_t buffer_size = ::serialize(&dev_info, buffer);
+    char * buffer_ = (char *)malloc(buffer_size + 1);
+
+    if (buffer_ == NULL) {
+        LOG_ERR("%s: failed to allocate %zu bytes for device info serialization\n", 
+                __func__, buffer_size);
+        return 0;
+    }
+    
+    memcpy(buffer_, *buffer, buffer_size);
+    memcpy(buffer_ + buffer_size, &is_forwarder, 1);
+    free(*buffer);
+    *buffer = buffer_;
+    return buffer_size + 1;
 }

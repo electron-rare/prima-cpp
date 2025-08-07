@@ -293,10 +293,24 @@ struct model_bytes {
     int64_t nb_layer;
     int64_t nb_output;
 
+    // used to estimate the compute buffer size 
+    int64_t nb_output_w;
+    int64_t nb_output_norm_w;
+    int64_t nb_attn_norm_w;
+    int64_t nb_attn_q_w;
+    int64_t nb_ffn_gate_w;
+    int64_t nb_ffn_down_w;
+
     model_bytes() :
-        nb_input (0),
-        nb_layer (0),
-        nb_output(0) {}
+        nb_input        (0),
+        nb_layer        (0),
+        nb_output       (0), 
+        nb_output_w     (0),
+        nb_output_norm_w(0),
+        nb_attn_norm_w  (0),
+        nb_attn_q_w     (0),
+        nb_ffn_gate_w   (0),
+        nb_ffn_down_w   (0) {}
 };
 
 struct disk_props {
@@ -346,6 +360,18 @@ struct device_info {
         model_bytes() {}
 };
 
+struct TopoRebuildHelperInfo{
+    struct device_info dev_info;
+    char               is_forwarder;
+    
+    TopoRebuildHelperInfo():
+        dev_info(),
+        is_forwarder(0){}
+    
+    void   deserialize(const char * buffer);
+    size_t serialize(char ** buffer) const;
+};
+
 enum profiler_backend_type {
     PROFILER_BACKEND_TYPE_CPU   = 0,
     PROFILER_BACKEND_TYPE_METAL = 1,
@@ -389,6 +415,6 @@ int      device_has_blas   (void);
 int      device_has_sycl   (void);
 
 size_t   serialize  (const struct device_info * dev_info, char ** buffer);
-void     deserialize(const char * buffer, struct device_info * dev_info);
+size_t   deserialize(const char * buffer, struct device_info * dev_info);
 
 #endif // PROFILER_H
