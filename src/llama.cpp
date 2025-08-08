@@ -18229,7 +18229,8 @@ static void llama_send_tensors(zmq::socket_t & socket, struct llama_ubatch * uba
             send_msgs.emplace_back("int32", strlen("int32"));
             send_msgs.emplace_back(tensors->inp_pos->ne, sizeof(tensors->inp_pos->ne[0]));
             buf_size = tensors->inp_pos->ne[0] * sizeof(int32_t);
-            send_msgs.emplace_back(0, sizeof(int64_t));  // extra frame that recv does not account for
+            int64_t zero = 0;
+            send_msgs.emplace_back(&zero, sizeof(int64_t));  // extra frame that recv does not account for
             send_msgs.emplace_back(ubatch->pos, buf_size);
         }
 
