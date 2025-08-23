@@ -18135,17 +18135,19 @@ static int llama_recv_meta(zmq::socket_t & socket, struct sync_meta * meta) {
     return 0;
 }
 
-static void llama_send_tensors(zmq::socket_t & socket, struct llama_ubatch * ubatch, struct input_tensors * tensors, const char * dump_folder = nullptr) {
+static void llama_send_tensors(zmq::socket_t & socket, struct llama_ubatch * ubatch, struct input_tensors * tensors, const char * dump_folder = nullptr, const bool enable_comm_compute_log = true, const int my_rank = 0) {
     g_llama_send_tensors_counts++;
     try {
         std::vector<zmq::message_t> send_msgs;
         int64_t num_elements = tensors->sub_gf_out->ne[0] * tensors->sub_gf_out->ne[1];
         int64_t float_element_size   = num_elements * sizeof(float);
         quantized_array_t * quantized_array = NULL;
+        std::string start_compute_time = get_iso8601_ms_timestamp();
         if (quantize(ubatch->backend_embd, num_elements, 0 /*q8_0*/, &quantized_array) || !quantized_array) {
             LLAMA_LOG_INFO("Failed to allocate space or doing quantization\n");   
             return;
         }
+        std::string end_compute_time = get_iso8601_ms_timestamp();
         int64_t buf_size = get_quantized_array_size(quantized_array);
         
         send_msgs.emplace_back("sub_gf_out", strlen("sub_gf_out"));
@@ -18167,6 +18169,11 @@ static void llama_send_tensors(zmq::socket_t & socket, struct llama_ubatch * uba
 
         zmq::send_multipart(socket, send_msgs);
         free_quantized_array(quantized_array);
+        
+        if (enable_comm_compute_log) {
+            LLAMA_LOG_INFO("[%d][%s][compute][start][quantize send tensor]\n", my_rank, start_compute_time.c_str());
+            LLAMA_LOG_INFO("[%d][%s][compute][end][quantize send tensor]\n", my_rank, end_compute_time.c_str());
+        }
 
         if (dump_folder && strlen(dump_folder) > 0) {
             std::string dump_path = std::string(dump_folder) + "/send_" + std::to_string(g_llama_send_tensors_counts) + ".bin";
@@ -18181,7 +18188,7 @@ static void llama_send_tensors(zmq::socket_t & socket, struct llama_ubatch * uba
     }
 }
 
-static void llama_recv_tensors(zmq::socket_t & socket, struct llama_ubatch * ubatch, const bool is_out_embd=false, const char * dump_folder = nullptr) {
+static void llama_recv_tensors(zmq::socket_t & socket, struct llama_ubatch * ubatch, const bool is_out_embd=false, const char * dump_folder = nullptr, const bool enable_comm_compute_log = true, const int my_rank = 0) {
     g_llama_recv_tensors_counts++;
     std::vector<zmq::message_t> recv_msgs;
     if (!zmq::recv_multipart(socket, std::back_inserter(recv_msgs))) {
@@ -18209,9 +18216,16 @@ static void llama_recv_tensors(zmq::socket_t & socket, struct llama_ubatch * uba
             }
             std::memcpy(quantized_array, data_msg.data(), *buf_size);
             
+            std::string start_compute_time = get_iso8601_ms_timestamp();
             dequantize(quantized_array, batch_embd);
+            std::string end_compute_time = get_iso8601_ms_timestamp();
+
             free_quantized_array(quantized_array);
 
+            if (enable_comm_compute_log) {
+                LLAMA_LOG_INFO("[%d][%s][compute][start][quantize send tensor]\n", my_rank, start_compute_time.c_str());
+                LLAMA_LOG_INFO("[%d][%s][compute][end][quantize send tensor]\n", my_rank, end_compute_time.c_str());
+            }
             if (dump_folder && strlen(dump_folder) > 0) {
                 std::string dump_path = std::string(dump_folder) + "/recv_" + std::to_string(g_llama_recv_tensors_counts) + ".bin";
                 dump_tensors(dump_path, static_cast<uint8_t>(TensorDataType::FLOAT32), 
@@ -18660,7 +18674,7 @@ static int llama_decode_internal(
                 if (lctx.cparams.enable_comm_compute_log) {
                     LLAMA_LOG_INFO("[%d][%s][comm][start][recv_tensors][sbatch_tokens: %lu, ubatch_tokens: %u, receive data from other nodes]\n", my_rank, get_iso8601_ms_timestamp().c_str(), lctx.sbatch.n_tokens, ubatch.n_tokens);
                 }
-                llama_recv_tensors(*lctx.recv_socket, &ubatch, is_out_embd, lctx.cparams.dump_folder);
+                llama_recv_tensors(*lctx.recv_socket, &ubatch, is_out_embd, lctx.cparams.dump_folder, lctx.cparams.enable_comm_compute_log, my_rank);
                 if (lctx.cparams.enable_comm_compute_log) {
                     LLAMA_LOG_INFO("[%d][%s][comm][end][recv_tensors][sbatch_tokens: %lu, ubatch_tokens: %u, receive data from other nodes]\n", my_rank, get_iso8601_ms_timestamp().c_str(), lctx.sbatch.n_tokens, ubatch.n_tokens);
                 }
@@ -18740,7 +18754,7 @@ static int llama_decode_internal(
                 struct input_tensors tensors = {sub_gf_out, lctx.inp_pos};
                 const bool is_to_master = my_rank != 0 && is_last_l;
                 zmq::socket_t * s = is_to_master ? lctx.master_socket : lctx.send_socket;
-                llama_send_tensors(*s, &ubatch, &tensors, lctx.cparams.dump_folder);
+                llama_send_tensors(*s, &ubatch, &tensors, lctx.cparams.dump_folder, lctx.cparams.enable_comm_compute_log, my_rank);
                 if (lctx.cparams.enable_comm_compute_log) {
                     LLAMA_LOG_INFO("[%d][%s][comm][end][send_tensors][sbatch_tokens: %lu, ubatch_tokens: %u, send the result to the next node or the master]\n", my_rank, get_iso8601_ms_timestamp().c_str(), lctx.sbatch.n_tokens, ubatch.n_tokens);
                 }
