@@ -2717,6 +2717,7 @@ struct llama_cparams {
 
     const char * dump_folder;
     bool enable_comm_compute_log;
+    const char * comm_datatype;
 };
 
 // TODO: separate into "llama_layer_enc" and "llama_layer_dec"
@@ -18135,27 +18136,52 @@ static int llama_recv_meta(zmq::socket_t & socket, struct sync_meta * meta) {
     return 0;
 }
 
-static void llama_send_tensors(zmq::socket_t & socket, struct llama_ubatch * ubatch, struct input_tensors * tensors, const char * dump_folder = nullptr, const bool enable_comm_compute_log = true, const int my_rank = 0) {
+static void llama_send_tensors(zmq::socket_t & socket, struct llama_ubatch * ubatch, struct input_tensors * tensors, const char * dump_folder = nullptr, const bool enable_comm_compute_log = true, const int my_rank = 0, const char * comm_datatype = nullptr) {
     g_llama_send_tensors_counts++;
     try {
         std::vector<zmq::message_t> send_msgs;
         int64_t num_elements = tensors->sub_gf_out->ne[0] * tensors->sub_gf_out->ne[1];
         int64_t float_element_size   = num_elements * sizeof(float);
-        quantized_array_t * quantized_array = NULL;
-        std::string start_compute_time = get_iso8601_ms_timestamp();
-        if (quantize(ubatch->backend_embd, num_elements, 0 /*q8_0*/, &quantized_array) || !quantized_array) {
-            LLAMA_LOG_INFO("Failed to allocate space or doing quantization\n");   
+        
+        std::string comm_datatype_string = std::string(comm_datatype);
+        bool quantized = false;
+        std::string start_compute_time = "";
+        std::string end_compute_time = "";
+        int64_t buf_size = 0;
+        quantized_array_t *quantized_array = NULL;
+        if (comm_datatype_string == "f32") {            
+            buf_size = float_element_size;
+            send_msgs.emplace_back("sub_gf_out", strlen("sub_gf_out"));
+            send_msgs.emplace_back("normal", strlen("normal"));
+            send_msgs.emplace_back(tensors->sub_gf_out->ne, sizeof(tensors->sub_gf_out->ne));
+            send_msgs.emplace_back(ubatch->backend_embd, buf_size);
+            send_msgs.emplace_back(&buf_size, sizeof(int64_t));
+        } else if (comm_datatype_string == "q8_0" || comm_datatype_string == "q4_0") {
+            quantized = true;
+            int qtype = (comm_datatype_string == "q8_0") ? 0 : 1;
+
+            start_compute_time = get_iso8601_ms_timestamp();
+
+            if (quantize(ubatch->backend_embd, num_elements, qtype,
+                         &quantized_array) || !quantized_array) {
+                LLAMA_LOG_INFO("Failed to allocate space or do quantization\n");
+                return;
+            }
+
+            end_compute_time = get_iso8601_ms_timestamp();
+            buf_size = get_quantized_array_size(quantized_array);
+
+            send_msgs.emplace_back("sub_gf_out", strlen("sub_gf_out"));
+            send_msgs.emplace_back("quantized", strlen("quantized"));
+            send_msgs.emplace_back(tensors->sub_gf_out->ne,
+                                   sizeof(tensors->sub_gf_out->ne));
+            send_msgs.emplace_back(quantized_array, buf_size);
+            send_msgs.emplace_back(&buf_size, sizeof(buf_size));
+        } else {
+            LLAMA_LOG_INFO("Unsupported communication type = %s\n", comm_datatype_string);   
             return;
         }
-        std::string end_compute_time = get_iso8601_ms_timestamp();
-        int64_t buf_size = get_quantized_array_size(quantized_array);
-        
-        send_msgs.emplace_back("sub_gf_out", strlen("sub_gf_out"));
-        send_msgs.emplace_back("quantized", strlen("quantized"));
-        send_msgs.emplace_back(tensors->sub_gf_out->ne, sizeof(tensors->sub_gf_out->ne));
-        send_msgs.emplace_back(quantized_array, buf_size);
-        send_msgs.emplace_back(&buf_size, sizeof(int64_t));
-        
+
         if (tensors->inp_pos) {
             int64_t zero = 0;
             buf_size = tensors->inp_pos->ne[0] * sizeof(int32_t);
@@ -18168,9 +18194,9 @@ static void llama_send_tensors(zmq::socket_t & socket, struct llama_ubatch * uba
         }
 
         zmq::send_multipart(socket, send_msgs);
-        free_quantized_array(quantized_array);
-        
-        if (enable_comm_compute_log) {
+
+        if (quantized) free_quantized_array(quantized_array);
+        if (quantized && enable_comm_compute_log) {
             LLAMA_LOG_INFO("[%d][%s][compute][start][send_tensors][quantize]\n", my_rank, start_compute_time.c_str());
             LLAMA_LOG_INFO("[%d][%s][compute][end][send_tensors][quantize]\n", my_rank, end_compute_time.c_str());
         }
@@ -18210,22 +18236,28 @@ static void llama_recv_tensors(zmq::socket_t & socket, struct llama_ubatch * uba
             int64_t num_elements = dims[0] * dims[1];
             int64_t float_element_size   = num_elements * sizeof(float);
 
-            quantized_array_t *quantized_array = load_quantized_array_from_buffer(data_msg.data(), *buf_size);
-            if (!quantized_array) {
-                LLAMA_LOG_INFO("Failed to load quantized array from buffer.\n");   
-                return;
+            if (comm_type == "quantized") {
+                quantized_array_t *quantized_array = load_quantized_array_from_buffer(data_msg.data(), *buf_size);
+                if (!quantized_array) {
+                    LLAMA_LOG_INFO("Failed to load quantized array from buffer.\n");   
+                    return;
+                }
+
+                std::string start_compute_time = get_iso8601_ms_timestamp();
+                dequantize(quantized_array, batch_embd); 
+                std::string end_compute_time = get_iso8601_ms_timestamp();
+
+                free_quantized_array(quantized_array);
+
+                if (enable_comm_compute_log) {
+                    LLAMA_LOG_INFO("[%d][%s][compute][start][recv_tensors][dequantize]\n", my_rank, start_compute_time.c_str());
+                    LLAMA_LOG_INFO("[%d][%s][compute][end][recv_tensors][dequantize]\n", my_rank, end_compute_time.c_str());
+                }
             }
-
-            std::string start_compute_time = get_iso8601_ms_timestamp();
-            dequantize(quantized_array, batch_embd); 
-            std::string end_compute_time = get_iso8601_ms_timestamp();
-
-            free_quantized_array(quantized_array);
-
-            if (enable_comm_compute_log) {
-                LLAMA_LOG_INFO("[%d][%s][compute][start][recv_tensors][dequantize]\n", my_rank, start_compute_time.c_str());
-                LLAMA_LOG_INFO("[%d][%s][compute][end][recv_tensors][dequantize]\n", my_rank, end_compute_time.c_str());
+            else {
+                std::memcpy(batch_embd, data_msg.data(), float_element_size);
             }
+            
             if (dump_folder && strlen(dump_folder) > 0) {
                 std::string dump_path = std::string(dump_folder) + "/recv_" + std::to_string(g_llama_recv_tensors_counts) + ".bin";
                 dump_tensors(dump_path, static_cast<uint8_t>(TensorDataType::FLOAT32), 
@@ -18754,7 +18786,7 @@ static int llama_decode_internal(
                 struct input_tensors tensors = {sub_gf_out, lctx.inp_pos};
                 const bool is_to_master = my_rank != 0 && is_last_l;
                 zmq::socket_t * s = is_to_master ? lctx.master_socket : lctx.send_socket;
-                llama_send_tensors(*s, &ubatch, &tensors, lctx.cparams.dump_folder, lctx.cparams.enable_comm_compute_log, my_rank);
+                llama_send_tensors(*s, &ubatch, &tensors, lctx.cparams.dump_folder, lctx.cparams.enable_comm_compute_log, my_rank, lctx.cparams.comm_datatype);
                 if (lctx.cparams.enable_comm_compute_log) {
                     LLAMA_LOG_INFO("[%d][%s][comm][end][send_tensors][sbatch_tokens: %lu, ubatch_tokens: %u, send the result to the next node or the master]\n", my_rank, get_iso8601_ms_timestamp().c_str(), lctx.sbatch.n_tokens, ubatch.n_tokens);
                 }
@@ -20514,6 +20546,7 @@ struct llama_context_params llama_context_default_params() {
         /*.abort_callback_data         =*/ nullptr,
         /*.dump_folder                 =*/ nullptr,
         /*.enable_comm_compute_log     =*/ false,
+        /*.comm_datatype                 =*/ nullptr,
     };
 
     return result;
@@ -21158,6 +21191,7 @@ struct llama_context * llama_new_context_with_model(
     ctx->cparams.force   = params.force;
     ctx->cparams.dump_folder = params.dump_folder;
     ctx->cparams.enable_comm_compute_log = params.enable_comm_compute_log;
+    ctx->cparams.comm_datatype = params.comm_datatype;
     ctx->cparams.original_next_rank = (params.rank + 1) % params.n_world;
     
     auto &hparams = model->hparams;

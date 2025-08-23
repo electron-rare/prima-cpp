@@ -2105,6 +2105,16 @@ struct llama_context_params llama_context_params_from_gpt_params(const gpt_param
 
     cparams.enable_comm_compute_log = params.enable_comm_compute_log;
 
+    if (cparams.comm_datatype != nullptr) {
+        delete[] cparams.comm_datatype;
+    }
+    if (!params.comm_datatype.empty()) {
+        cparams.comm_datatype = new char[params.comm_datatype.length() + 1];
+        std::strcpy(const_cast<char*>(cparams.comm_datatype), params.comm_datatype.c_str());
+    } else {
+        cparams.comm_datatype = nullptr;
+    }
+
     cparams.n_ctx             = params.n_ctx;
     cparams.n_predict         = params.n_predict;
     cparams.n_seq_max         = params.n_parallel;

@@ -2119,6 +2119,13 @@ gpt_params_context gpt_params_parser_init(gpt_params & params, llama_example ex,
         }
     ));
     add_opt(llama_arg(
+        {"--comm-datatype"}, "TYPE",
+        format("Datatype for communication, currently support f32, q8_0, q4_0 (default: %s)", params.comm_datatype.c_str()),
+        [](gpt_params & params, const std::string & value) {
+            params.comm_datatype = value;
+        }
+    ));
+    add_opt(llama_arg(
         {"--positive-file"}, "FNAME",
         format("positive prompts file, one prompt per line (default: '%s')", params.cvector_positive_file.c_str()),
         [](gpt_params & params, const std::string & value) {
