@@ -13,6 +13,8 @@
 #include "profiler.h"
 #include "network-utils.h"
 
+#include "quantization.h"
+
 #ifdef GGML_USE_RPC
 #  include "ggml-rpc.h"
 #endif
@@ -102,78 +104,6 @@
 #include <string.h>
 #include <math.h>
 #include <stdio.h>
-
-#define Q8_0_BLOCK_SIZE 64
-
-// One Q8_0 block = scale + 64 int8s
-typedef struct {
-    float  d;              // scale
-    int8_t qs[Q8_0_BLOCK_SIZE];      // quantized values
-} block_q8_0;
-
-// Quantize a 1D float array into Q8_0 blocks.
-// - in:  pointer to N floats
-// - N:   number of elements
-// - out_blocks: *out set to malloc'd array of blocks; caller frees
-// Returns number of blocks (ceil(N/32)). On error returns 0.
-int64_t q8_0_quantize(const float *in, int64_t N, block_q8_0 **out_blocks) {
-    if (!in || !out_blocks || N == 0) return 0;
-
-    const int64_t nb = (N + Q8_0_BLOCK_SIZE - 1) / Q8_0_BLOCK_SIZE;
-    block_q8_0 *blk = (block_q8_0 *)malloc(nb * sizeof(block_q8_0));
-    if (!blk) return 0;
-
-    for (int64_t b = 0; b < nb; ++b) {
-        const int64_t start = b * Q8_0_BLOCK_SIZE;
-        const int64_t rem   = (start + Q8_0_BLOCK_SIZE <= N) ? Q8_0_BLOCK_SIZE : (N - start);
-
-        // 1) find max-abs in this block
-        float amax = 0.0f;
-        for (int64_t i = 0; i < rem; ++i) {
-            float v = fabsf(in[start + i]);
-            if (v > amax) amax = v;
-        }
-
-        // 2) compute scale
-        float d = (amax > 0.0f) ? (amax / 127.0f) : 0.0f;
-        float invd = (d > 0.0f) ? (1.0f / d) : 0.0f;
-        blk[b].d = d;
-
-        // 3) quantize present elems, zero-pad the rest
-        for (int64_t i = 0; i < rem; ++i) {
-            float r = in[start + i] * invd;
-            // nearest int, then clamp to [-127, 127]
-            long qi = lrintf(r);
-            if (qi < -127) qi = -127;
-            if (qi >  127) qi =  127;
-            blk[b].qs[i] = (int8_t)qi;
-        }
-        for (int64_t i = rem; i < Q8_0_BLOCK_SIZE; ++i) {
-            blk[b].qs[i] = 0;
-        }
-    }
-
-    *out_blocks = blk;
-    return nb;
-}
-
-// Dequantize Q8_0 blocks back to floats.
-// - blocks: pointer to nb blocks
-// - N:      number of output floats desired (original length)
-// - out:    pointer to N floats (must be allocated by caller)
-void q8_0_dequantize(const block_q8_0 *blocks, int64_t nb, int64_t N, float *out) {
-    if (!blocks || !out || N == 0) return;
-
-    for (int64_t b = 0; b < nb; ++b) {
-        const int64_t start = b * Q8_0_BLOCK_SIZE;
-        const int64_t rem   = (start + Q8_0_BLOCK_SIZE <= N) ? Q8_0_BLOCK_SIZE : (N - start);
-        const float d = blocks[b].d;
-
-        for (int64_t i = 0; i < rem; ++i) {
-            out[start + i] = d * (float)blocks[b].qs[i];
-        }
-    }
-}
 
 int g_llama_send_tensors_counts = 0;
 int g_llama_recv_tensors_counts = 0;
@@ -18209,42 +18139,42 @@ static void llama_send_tensors(zmq::socket_t & socket, struct llama_ubatch * uba
     g_llama_send_tensors_counts++;
     try {
         std::vector<zmq::message_t> send_msgs;
-
+        int64_t num_elements = tensors->sub_gf_out->ne[0] * tensors->sub_gf_out->ne[1];
+        int64_t float_element_size   = num_elements * sizeof(float);
+        quantized_array_t * quantized_array = NULL;
+        if (quantize(ubatch->backend_embd, num_elements, 0 /*q8_0*/, &quantized_array) || !quantized_array) {
+            LLAMA_LOG_INFO("Failed to allocate space or doing quantization\n");   
+            return;
+        }
+        int64_t buf_size = get_quantized_array_size(quantized_array);
+        
         send_msgs.emplace_back("sub_gf_out", strlen("sub_gf_out"));
-        send_msgs.emplace_back("q8_0", strlen("q8_0"));
+        send_msgs.emplace_back("quantized", strlen("quantized"));
         send_msgs.emplace_back(tensors->sub_gf_out->ne, sizeof(tensors->sub_gf_out->ne));
-        // size_t buf_size = tensors->sub_gf_out->ne[0] * tensors->sub_gf_out->ne[1] * sizeof(float);
-        // send_msgs.emplace_back(ubatch->backend_embd, buf_size);
-
-        // q8_0 communication quantization
-        int64_t tensor_elements = tensors->sub_gf_out->ne[0] * tensors->sub_gf_out->ne[1];
-        block_q8_0 * quantized_data = NULL;
-        int64_t n_blocks = q8_0_quantize(ubatch->backend_embd, tensor_elements, &quantized_data);
-        int64_t buf_size = n_blocks * sizeof(block_q8_0);
-        send_msgs.emplace_back(&n_blocks, sizeof(n_blocks));
-        send_msgs.emplace_back(quantized_data, buf_size);
+        send_msgs.emplace_back(quantized_array, buf_size);
+        send_msgs.emplace_back(&buf_size, sizeof(int64_t));
         
         if (tensors->inp_pos) {
-            send_msgs.emplace_back("inp_pos", strlen("inp_pos"));
-            send_msgs.emplace_back("int32", strlen("int32"));
-            send_msgs.emplace_back(tensors->inp_pos->ne, sizeof(tensors->inp_pos->ne[0]));
-            buf_size = tensors->inp_pos->ne[0] * sizeof(int32_t);
             int64_t zero = 0;
-            send_msgs.emplace_back(&zero, sizeof(int64_t));  // extra frame that recv does not account for
+            buf_size = tensors->inp_pos->ne[0] * sizeof(int32_t);
+            
+            send_msgs.emplace_back("inp_pos", strlen("inp_pos"));
+            send_msgs.emplace_back("normal", strlen("normal"));
+            send_msgs.emplace_back(tensors->inp_pos->ne, sizeof(tensors->inp_pos->ne[0]));
             send_msgs.emplace_back(ubatch->pos, buf_size);
+            send_msgs.emplace_back(&zero, sizeof(int64_t));
         }
 
         zmq::send_multipart(socket, send_msgs);
-        free(quantized_data);
+        free_quantized_array(quantized_array);
 
-        // TODO: Fix dump feature to support int8
-        // if (dump_folder && strlen(dump_folder) > 0) {
-        //     std::string dump_path = std::string(dump_folder) + "/send_" + std::to_string(g_llama_send_tensors_counts) + ".bin";
-        //     dump_tensors(dump_path, static_cast<uint8_t>(TensorDataType::FLOAT32), 
-        //                 static_cast<uint64_t>(tensors->sub_gf_out->ne[0]), 
-        //                 static_cast<uint64_t>(tensors->sub_gf_out->ne[1]), 
-        //                 buf_size, ubatch->backend_embd);
-        // }
+        if (dump_folder && strlen(dump_folder) > 0) {
+            std::string dump_path = std::string(dump_folder) + "/send_" + std::to_string(g_llama_send_tensors_counts) + ".bin";
+            dump_tensors(dump_path, static_cast<uint8_t>(TensorDataType::FLOAT32), 
+                        static_cast<uint64_t>(tensors->sub_gf_out->ne[0]), 
+                        static_cast<uint64_t>(tensors->sub_gf_out->ne[1]), 
+                        float_element_size, ubatch->backend_embd);
+        }
 
     } catch (const zmq::error_t& e) {
         LLAMA_LOG_INFO("Failed to send tensor data: %s\n", e.what());
@@ -18263,37 +18193,32 @@ static void llama_recv_tensors(zmq::socket_t & socket, struct llama_ubatch * uba
         std::string key = recv_msgs[i].to_string();
         std::string comm_type = recv_msgs[i + 1].to_string();
         zmq::message_t &dims_msg = recv_msgs[i + 2];
-        zmq::message_t &n_blocks_msg = recv_msgs[i + 3];
-        zmq::message_t &data_msg = recv_msgs[i + 4];
+        zmq::message_t &data_msg = recv_msgs[i + 3];
+        zmq::message_t &buffer_size_msg = recv_msgs[i + 4];
 
         if (key == "sub_gf_out") {
             int64_t * dims       = static_cast<int64_t *>(dims_msg.data());
-            int64_t * n_blocks_ptr = static_cast<int64_t*>(n_blocks_msg.data());
-            int64_t n_blocks = *n_blocks_ptr;
-            int64_t buf_size = n_blocks * sizeof(block_q8_0);
-            block_q8_0 *quantized_data = (block_q8_0 *)malloc(n_blocks * sizeof(block_q8_0));
-            if (!quantized_data) {
+            int64_t * buf_size = static_cast<int64_t *>(buffer_size_msg.data());
+            float   * batch_embd = is_out_embd ? ubatch->out_embd : ubatch->backend_embd;
+            int64_t float_element_size   = dims[0] * dims[1] * sizeof(float);
+
+            quantized_array_t *quantized_array = (quantized_array_t*)malloc(*buf_size);
+            if (!quantized_array) {
                 LLAMA_LOG_INFO("Failed to allocate space for recv data.\n");   
                 return;
             }
-            std::memcpy(quantized_data, data_msg.data(), buf_size);
-            float   * batch_embd = is_out_embd ? ubatch->out_embd : ubatch->backend_embd;
-            int64_t tensor_elements = dims[0] * dims[1];
-            q8_0_dequantize(quantized_data, n_blocks, tensor_elements, batch_embd);
-            free(quantized_data);
+            std::memcpy(quantized_array, data_msg.data(), *buf_size);
+            
+            dequantize(quantized_array, batch_embd);
+            free_quantized_array(quantized_array);
 
-            // size_t    buf_size   = dims[0] * dims[1] * sizeof(float);
-            // std::memcpy(batch_embd, data_msg.data(), buf_size);
-
-            // TODO: Fix dump feature to support int8
-            // if (dump_folder && strlen(dump_folder) > 0) {
-            //     std::string dump_path = std::string(dump_folder) + "/recv_" + std::to_string(g_llama_recv_tensors_counts) + ".bin";
-            //     dump_tensors(dump_path, static_cast<uint8_t>(TensorDataType::FLOAT32), 
-            //                 static_cast<uint64_t>(dims[0]), 
-            //                 static_cast<uint64_t>(dims[1]), 
-            //                 buf_size, data_msg.data());
-            // }
-
+            if (dump_folder && strlen(dump_folder) > 0) {
+                std::string dump_path = std::string(dump_folder) + "/recv_" + std::to_string(g_llama_recv_tensors_counts) + ".bin";
+                dump_tensors(dump_path, static_cast<uint8_t>(TensorDataType::FLOAT32), 
+                            static_cast<uint64_t>(dims[0]), 
+                            static_cast<uint64_t>(dims[1]), 
+                            float_element_size, batch_embd);
+            }
         } else if (key == "inp_pos") {
             int64_t * dims  = static_cast<int64_t *>(dims_msg.data());
             size_t buf_size = dims[0] * sizeof(int32_t);
