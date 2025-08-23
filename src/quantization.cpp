@@ -2,8 +2,7 @@
 
 static int64_t _get_q8_0_quantized_array_size(const quantized_array_t *quantized_array) {
     if (!quantized_array) return 0;
-    return sizeof(uint8_t)        /* quantized_type   */
-         + 3 * sizeof(uint64_t)   /* num_elements, num_blocks, block_size */
+    return sizeof(quantized_array_t)    /* quantized_type num_elements, num_blocks, block_size */
          + quantized_array->num_blocks * sizeof(float)   /* scales */
          + quantized_array->num_elements * sizeof(int8_t); /* data */
 }
@@ -31,8 +30,7 @@ int64_t get_quantized_array_size(const quantized_array_t *quantized_array) {
 }
 
 quantized_array_t *allocate_q8_0_array(uint64_t num_elements,
-                                       uint64_t block_size)
-{
+                                       uint64_t block_size) {
     if (!num_elements || !block_size) return NULL;
 
     uint64_t num_blocks = (num_elements + block_size - 1) / block_size;
@@ -57,8 +55,7 @@ quantized_array_t *allocate_q8_0_array(uint64_t num_elements,
 }
 
 quantized_array_t *allocate_q4_0_array(uint64_t num_elements,
-                                       uint64_t block_size)
-{
+                                       uint64_t block_size) {
     if (!num_elements || !block_size) return NULL;
 
     uint64_t num_blocks = (num_elements + block_size - 1) / block_size;
@@ -85,6 +82,25 @@ quantized_array_t *allocate_q4_0_array(uint64_t num_elements,
 void free_quantized_array(quantized_array_t *quantized_array) {
     if (!quantized_array) return;
     free(quantized_array);
+}
+
+quantized_array_t *load_quantized_array_from_buffer(const void *buffer, int64_t buffer_size) {
+    quantized_array_t *quantized_array = (quantized_array_t*)calloc(1, buffer_size);
+    if (!quantized_array) return NULL;
+    
+    std::memcpy(quantized_array, buffer, buffer_size);
+    switch (quantized_array->quantized_type) {
+        case 0: /* q8_0 */
+            quantized_array->scales = (float*)(quantized_array + 1);
+            quantized_array->data   = (int8_t*)(quantized_array->scales + quantized_array->num_blocks);
+            return quantized_array;
+        case 1: /* q4_0 */
+            quantized_array->scales = (float*)(quantized_array + 1);
+            quantized_array->data   = (int8_t*)(quantized_array->scales + quantized_array->num_blocks);
+            return quantized_array;
+        default: 
+            return NULL; /* unknown type */
+    }
 }
 
 static int _quantize_q8_0(const float *float_array,

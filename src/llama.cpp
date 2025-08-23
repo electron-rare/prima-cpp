@@ -18171,8 +18171,8 @@ static void llama_send_tensors(zmq::socket_t & socket, struct llama_ubatch * uba
         free_quantized_array(quantized_array);
         
         if (enable_comm_compute_log) {
-            LLAMA_LOG_INFO("[%d][%s][compute][start][quantize send tensor]\n", my_rank, start_compute_time.c_str());
-            LLAMA_LOG_INFO("[%d][%s][compute][end][quantize send tensor]\n", my_rank, end_compute_time.c_str());
+            LLAMA_LOG_INFO("[%d][%s][compute][start][send_tensors][quantize]\n", my_rank, start_compute_time.c_str());
+            LLAMA_LOG_INFO("[%d][%s][compute][end][send_tensors][quantize]\n", my_rank, end_compute_time.c_str());
         }
 
         if (dump_folder && strlen(dump_folder) > 0) {
@@ -18207,24 +18207,24 @@ static void llama_recv_tensors(zmq::socket_t & socket, struct llama_ubatch * uba
             int64_t * dims       = static_cast<int64_t *>(dims_msg.data());
             int64_t * buf_size = static_cast<int64_t *>(buffer_size_msg.data());
             float   * batch_embd = is_out_embd ? ubatch->out_embd : ubatch->backend_embd;
-            int64_t float_element_size   = dims[0] * dims[1] * sizeof(float);
+            int64_t num_elements = dims[0] * dims[1];
+            int64_t float_element_size   = num_elements * sizeof(float);
 
-            quantized_array_t *quantized_array = (quantized_array_t*)malloc(*buf_size);
+            quantized_array_t *quantized_array = load_quantized_array_from_buffer(data_msg.data(), *buf_size);
             if (!quantized_array) {
-                LLAMA_LOG_INFO("Failed to allocate space for recv data.\n");   
+                LLAMA_LOG_INFO("Failed to load quantized array from buffer.\n");   
                 return;
             }
-            std::memcpy(quantized_array, data_msg.data(), *buf_size);
-            
+
             std::string start_compute_time = get_iso8601_ms_timestamp();
-            dequantize(quantized_array, batch_embd);
+            dequantize(quantized_array, batch_embd); 
             std::string end_compute_time = get_iso8601_ms_timestamp();
 
             free_quantized_array(quantized_array);
 
             if (enable_comm_compute_log) {
-                LLAMA_LOG_INFO("[%d][%s][compute][start][quantize send tensor]\n", my_rank, start_compute_time.c_str());
-                LLAMA_LOG_INFO("[%d][%s][compute][end][quantize send tensor]\n", my_rank, end_compute_time.c_str());
+                LLAMA_LOG_INFO("[%d][%s][compute][start][recv_tensors][dequantize]\n", my_rank, start_compute_time.c_str());
+                LLAMA_LOG_INFO("[%d][%s][compute][end][recv_tensors][dequantize]\n", my_rank, end_compute_time.c_str());
             }
             if (dump_folder && strlen(dump_folder) > 0) {
                 std::string dump_path = std::string(dump_folder) + "/recv_" + std::to_string(g_llama_recv_tensors_counts) + ".bin";

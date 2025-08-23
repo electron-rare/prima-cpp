@@ -1,6 +1,8 @@
 #ifndef QUANTIZATION_H
 #define QUANTIZATION_H
 
+/* To ensure can also compiled with c++ */
+#include <cstring> 
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
@@ -29,6 +31,8 @@ quantized_array_t *allocate_q4_0_array(uint64_t num_elements,
 void free_quantized_array(quantized_array_t *quantized_array);
 
 int64_t get_quantized_array_size(const quantized_array_t *quantized_array);
+
+quantized_array_t *load_quantized_array_from_buffer(const void *buffer, int64_t buffer_size);
 
 int quantize(const float *float_array,
              uint64_t num_elements,
