@@ -240,4 +240,47 @@ Enable distributed perplexity evaluation using `llama-perplexity` as master coor
 
 # On rank 1 (worker node), run:
 ./llama-cli -m download/qwq-32b-q4_k_m.gguf --world 2 --rank 1 --master 192.168.1.2 --next 192.168.1.2
-``
+```
+
+## Communication Compression
+
+Enable configurable compression of inter-node tensor communication to reduce bandwidth usage while maintaining flexibility in datatype handling.
+
+- commits (ff310e7-3a97a82)
+
+### Purpose
+
+This feature allows each rank to specify the datatype used when sending tensors across nodes. Every rank is only responsible for compressing its own send data. On the receiving side, the system automatically inspects the metadata to determine whether the payload is quantized and needs dequantization.
+
+New CLI Argument (`--comm-datatype TYPE`) for setting the communication datatype. Supported values:
+- f32 (default, no compression)
+- q8_0 (8-bit block quantization)
+- q4_0 (4-bit block quantization)
+
+Communication Logic
+- Send path:
+    - If f32, tensors are transmitted directly.
+    - If q8_0 or q4_0, tensors are quantized before sending.
+- Receive path:
+    - Metadata indicates if the payload is raw or quantized.
+    - Quantized payloads are automatically dequantized back to float32.
+
+This separation ensures each rank only manages compression for its own outputs, while reception remains transparent.
+
+### Example Usage
+
+#### Rank 0 (send tensors in q8_0 format)
+
+`./llama-cli --model model.gguf --world 2 --rank 0 --comm-datatype q8_0`
+
+#### Rank 1 (receive q8_0 data and auto-dequantize to f32, send tensors in q8_0 format)
+
+`./llama-cli --model model.gguf --world 2 --rank 1 --comm-datatype q8_0`
+
+By default, communication uses f32 with no quantization applied.
+
+### Quantization / Dequantization Timing
+
+To measure the overhead of quantization and dequantization, enable: `--enable-comm-compute-log`
+
+This will produce timestamped logs marking the start and end of both quantize and dequantize operations for profiling and debugging.
