@@ -18189,11 +18189,11 @@ static void llama_send_tensors(zmq::socket_t & socket, struct llama_ubatch * uba
                 return;
             }
             
-            float sparse_ratio = comm_sparse_percentage / 100;
+            float sparse_ratio = (float) comm_sparse_percentage / 100;
             sparse_array_t *sparse_array = NULL;
 
             start_compute_time = get_iso8601_ms_timestamp();
-            if (compress(ubatch->backend_embd, tensors->sub_gf_out->ne[0], tensors->sub_gf_out->ne[1], sparse_ratio, &sparse_array)) {
+            if (compress(ubatch->backend_embd, tensors->sub_gf_out->ne[1], tensors->sub_gf_out->ne[0], sparse_ratio, &sparse_array)) {
                 fprintf(stderr, "compress failed for ratio %.2f\n", sparse_ratio);
                 free_sparse_array(sparse_array);
                 return;
