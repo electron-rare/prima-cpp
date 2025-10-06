@@ -381,6 +381,8 @@ struct gpt_params {
     bool enable_comm_compute_log = false; // enable/disable communication and computation logging
 
     std::string comm_datatype = "f32"; // data type for communication
+
+    int comm_sparse_percentage = 100;
 };
 
 // call once at the start of a program if it uses libcommon

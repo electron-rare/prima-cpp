@@ -399,6 +399,8 @@ extern "C" {
         bool enable_comm_compute_log;
         
         const char * comm_datatype;
+
+        int comm_sparse_percentage;
     };
 
     // model quantization parameters

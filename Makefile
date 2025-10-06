@@ -956,6 +956,7 @@ OBJ_LLAMA = \
 	src/unicode-data.o \
 	src/network-utils.o \
 	src/quantization.o \
+	src/sparsity.o \
 
 OBJ_COMMON = \
 	common/profiler.o \
@@ -1160,6 +1161,7 @@ src/llama.o: \
 	src/unicode.h \
 	src/network-utils.h \
 	src/quantization.h \
+	src/sparsity.h \
 	include/llama.h \
 	ggml/include/ggml-cuda.h \
 	ggml/include/ggml-metal.h \
@@ -1179,6 +1181,11 @@ src/quantization.o: \
 	src/quantization.cpp \
 	src/quantization.h 
 	$(CXX) $(CXXFLAGS) -c $< -o $@
+
+src/sparsity.o: \
+	src/sparsity.cpp \
+	src/sparsity.h 
+	$(CXX) $(CXXFLAGS) -c $< -o $@ -fopenmp
 
 src/llama-grammar.o: \
 	src/llama-grammar.cpp \
