@@ -244,43 +244,66 @@ Enable distributed perplexity evaluation using `llama-perplexity` as master coor
 
 ## Communication Compression
 
-Enable configurable compression of inter-node tensor communication to reduce bandwidth usage while maintaining flexibility in datatype handling.
+Enable configurable compression of inter-node tensor communication to reduce bandwidth usage while maintaining flexibility in data type handling.
 
-- commits (ff310e7-3a97a82)
+- Quantization commits (ff310e7–3a97a82)
+- Sparsity commits (45a78f2–9e730dd)
 
 ### Purpose
 
-This feature allows each rank to specify the datatype used when sending tensors across nodes. Every rank is only responsible for compressing its own send data. On the receiving side, the system automatically inspects the metadata to determine whether the payload is quantized and needs dequantization.
+This feature allows each rank to specify the data type used when sending tensors across nodes. Each rank is responsible only for compressing its own outgoing data. On the receiving side, the system automatically inspects the metadata to determine whether the payload is quantized and requires dequantization.
 
-New CLI Argument (`--comm-datatype TYPE`) for setting the communication datatype. Supported values:
+A new CLI argument (`--comm_datatype TYPE`) sets the communication data type. Supported values:
+
 - f32 (default, no compression)
 - q8_0 (8-bit block quantization)
 - q4_0 (4-bit block quantization)
+- f32_sparsity (no quantization, but allows `--comm_sparse_percentage` to select the top-k features for each token based on the specified sparsity percentage)
 
-Communication Logic
-- Send path:
-    - If f32, tensors are transmitted directly.
-    - If q8_0 or q4_0, tensors are quantized before sending.
-- Receive path:
-    - Metadata indicates if the payload is raw or quantized.
-    - Quantized payloads are automatically dequantized back to float32.
+### Communication Logic
 
-This separation ensures each rank only manages compression for its own outputs, while reception remains transparent.
+- **Send path**
+
+  - If `f32`, tensors are transmitted directly.
+  - If `q8_0` or `q4_0`, tensors are quantized before transmission.
+  - If `f32_sparsity`, tensors are pruned before transmission.
+
+- **Receive path**
+
+  - Metadata indicates whether the payload is raw or quantized.
+  - Quantized payloads are automatically dequantized to float32.
+  - Sparse payloads are automatically decompressed to float32, with pruned values restored as zeros.
+
+This design ensures that each rank manages compression only for its own outputs, while reception remains transparent.
 
 ### Example Usage
 
 #### Rank 0 (send tensors in q8_0 format)
 
-`./llama-cli --model model.gguf --world 2 --rank 0 --comm-datatype q8_0`
+```
+./llama-cli --model model.gguf --world 2 --rank 0 --comm_datatype q8_0
+```
 
-#### Rank 1 (receive q8_0 data and auto-dequantize to f32, send tensors in q8_0 format)
+#### Rank 1 (receive q8_0 data, auto-dequantize to f32, send tensors in q8_0 format)
 
-`./llama-cli --model model.gguf --world 2 --rank 1 --comm-datatype q8_0`
+```
+./llama-cli --model model.gguf --world 2 --rank 1 --comm_datatype q8_0
+```
 
-By default, communication uses f32 with no quantization applied.
+By default, communication uses `f32` with no quantization.
 
-### Quantization / Dequantization Timing
+#### Sparsity Example
 
-To measure the overhead of quantization and dequantization, enable: `--enable-comm-compute-log`
+```
+./llama-cli --model model.gguf --world 2 --rank 0 --comm_datatype f32_sparsity --comm_sparse_percentage 20
+```
 
-This will produce timestamped logs marking the start and end of both quantize and dequantize operations for profiling and debugging.
+### Quantization and Dequantization Timing
+
+To measure the overhead of quantization and dequantization, enable:
+
+```
+--enable-comm-compute-log
+```
+
+This option produces timestamped logs that mark the start and end of quantization and dequantization operations for profiling and debugging.
