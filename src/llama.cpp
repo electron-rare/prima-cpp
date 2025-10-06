@@ -18293,7 +18293,7 @@ static void llama_recv_tensors(zmq::socket_t & socket, struct llama_ubatch * uba
                 }
 
                 std::string start_compute_time = get_iso8601_ms_timestamp();
-                decompress(sparse_array, batch_embd)
+                decompress(sparse_array, batch_embd);
                 std::string end_compute_time = get_iso8601_ms_timestamp();
 
                 free_sparse_array(sparse_array);
