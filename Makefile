@@ -957,6 +957,7 @@ OBJ_LLAMA = \
 	src/network-utils.o \
 	src/quantization.o \
 	src/sparsity.o \
+	src/k_quantization.o \
 
 OBJ_COMMON = \
 	common/profiler.o \
@@ -1186,6 +1187,11 @@ src/sparsity.o: \
 	src/sparsity.cpp \
 	src/sparsity.h 
 	$(CXX) $(CXXFLAGS) -c $< -o $@ -fopenmp
+
+src/k_quantization.o: \
+	src/k_quantization.cpp \
+	src/k_quantization.h 
+	$(CXX) $(CXXFLAGS) -c $< -o $@
 
 src/llama-grammar.o: \
 	src/llama-grammar.cpp \

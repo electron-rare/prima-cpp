@@ -15,6 +15,7 @@
 
 #include "quantization.h"
 #include "sparsity.h"
+#include "k_quantization.h"
 
 #ifdef GGML_USE_RPC
 #  include "ggml-rpc.h"
@@ -18183,6 +18184,30 @@ static void llama_send_tensors(zmq::socket_t & socket, struct llama_ubatch * uba
                 LLAMA_LOG_INFO("[%d][%s][compute][start][send_tensors][quantize]\n", my_rank, start_compute_time.c_str());
                 LLAMA_LOG_INFO("[%d][%s][compute][end][send_tensors][quantize]\n", my_rank, end_compute_time.c_str());
             }
+        } else if (comm_datatype_string == "q2_k") {
+            start_compute_time = get_iso8601_ms_timestamp();
+            quantized_array_q2_k_t *quantized_array = NULL;
+            if (k_quantize(ubatch->backend_embd, num_elements,
+                         &quantized_array) || !quantized_array) {
+                LLAMA_LOG_INFO("Failed to allocate space or do quantization\n");
+                return;
+            }
+
+            end_compute_time = get_iso8601_ms_timestamp();
+            buf_size = get_quantized_q2_k_array_size(quantized_array);
+
+            send_msgs.emplace_back("sub_gf_out", strlen("sub_gf_out"));
+            send_msgs.emplace_back("k_quantized", strlen("k_quantized"));
+            send_msgs.emplace_back(tensors->sub_gf_out->ne,
+                                   sizeof(tensors->sub_gf_out->ne));
+            send_msgs.emplace_back(quantized_array, buf_size);
+            send_msgs.emplace_back(&buf_size, sizeof(buf_size));
+
+            free_quantized_q2_k_array(quantized_array);
+            if (enable_comm_compute_log) {
+                LLAMA_LOG_INFO("[%d][%s][compute][start][send_tensors][k_quantize]\n", my_rank, start_compute_time.c_str());
+                LLAMA_LOG_INFO("[%d][%s][compute][end][send_tensors][k_quantize]\n", my_rank, end_compute_time.c_str());
+            }
         } else if (comm_datatype_string == "f32_sparsity") {
             if (comm_sparse_percentage < 1 && comm_sparse_percentage > 100) {
                 fprintf(stderr, "Sparse percentage %d should between 1~100\n", comm_sparse_percentage);
@@ -18283,6 +18308,24 @@ static void llama_recv_tensors(zmq::socket_t & socket, struct llama_ubatch * uba
                 if (enable_comm_compute_log) {
                     LLAMA_LOG_INFO("[%d][%s][compute][start][recv_tensors][dequantize]\n", my_rank, start_compute_time.c_str());
                     LLAMA_LOG_INFO("[%d][%s][compute][end][recv_tensors][dequantize]\n", my_rank, end_compute_time.c_str());
+                }
+            }
+            else if (comm_type == "k_quantized") {
+                quantized_array_q2_k_t *quantized_array = load_quantized_q2_k_array_from_buffer(data_msg.data(), *buf_size);
+                if (!quantized_array) {
+                    LLAMA_LOG_INFO("Failed to load quantized array from buffer.\n");   
+                    return;
+                }
+
+                std::string start_compute_time = get_iso8601_ms_timestamp();
+                k_dequantize(quantized_array, batch_embd); 
+                std::string end_compute_time = get_iso8601_ms_timestamp();
+
+                free_quantized_q2_k_array(quantized_array);
+
+                if (enable_comm_compute_log) {
+                    LLAMA_LOG_INFO("[%d][%s][compute][start][recv_tensors][k_dequantize]\n", my_rank, start_compute_time.c_str());
+                    LLAMA_LOG_INFO("[%d][%s][compute][end][recv_tensors][k_dequantize]\n", my_rank, end_compute_time.c_str());
                 }
             }
             else if (comm_type == "sparse") {
