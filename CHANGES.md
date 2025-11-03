@@ -258,6 +258,7 @@ A new CLI argument (`--comm_datatype TYPE`) sets the communication data type. Su
 - f32 (default, no compression)
 - q8_0 (8-bit block quantization)
 - q4_0 (4-bit block quantization)
+- q2_k (2-bit k quantization)
 - f32_sparsity (no quantization, but allows `--comm_sparse_percentage` to select the top-k features for each token based on the specified sparsity percentage)
 
 ### Communication Logic
@@ -265,7 +266,7 @@ A new CLI argument (`--comm_datatype TYPE`) sets the communication data type. Su
 - **Send path**
 
   - If `f32`, tensors are transmitted directly.
-  - If `q8_0` or `q4_0`, tensors are quantized before transmission.
+  - If `q8_0`, `q4_0` or `q2_k`, tensors are quantized before transmission.
   - If `f32_sparsity`, tensors are pruned before transmission.
 
 - **Receive path**
