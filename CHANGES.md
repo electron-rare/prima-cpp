@@ -244,10 +244,12 @@ Enable distributed perplexity evaluation using `llama-perplexity` as master coor
 
 ## Communication Compression
 
-Enable configurable compression of inter-node tensor communication to reduce bandwidth usage while maintaining flexibility in data type handling.
+Enable configurable compression of inter-node tensor communication to reduce bandwidth usage while maintaining flexibility in data type handling. The compression implementation uses [BitSqueeze](https://github.com/DandinPower/BitSqueeze).
 
 - Quantization commits (ff310e7–3a97a82)
 - Sparsity commits (45a78f2–9e730dd)
+- BitSqueeze commit (73969b4)
+- Threshold commit (73969b4)
 
 ### Purpose
 
@@ -256,24 +258,27 @@ This feature allows each rank to specify the data type used when sending tensors
 A new CLI argument (`--comm_datatype TYPE`) sets the communication data type. Supported values:
 
 - f32 (default, no compression)
-- q8_0 (8-bit block quantization)
-- q4_0 (4-bit block quantization)
-- q2_k (2-bit k quantization)
+- integer based (q8_0, q4_0, q2_k, iq2_s, iq2_xs, iq2_xxs)
+- float based (f32, bf16, fp16, fp8, fp4, mxfp8, mxfp4, nvfp4, nf4, nf4_dq)
 - f32_sparsity (no quantization, but allows `--comm_sparse_percentage` to select the top-k features for each token based on the specified sparsity percentage)
+
+A new CLI argument, comm_compression_threshold N, sets the tokens threshold before compression. Supported values:
+
+* must be larger than negative one
+* zero, will send the data based on comm_datatype no matter what
+* any value larger than zero, will determine whether to compress to comm_datatype based on the current processed tensors, for example in decoding the number of tokens is small, so if this value is set to ten it might only compress during the prefilling stage, the real situation will depend on your ubatch size and prompt size
 
 ### Communication Logic
 
 - **Send path**
 
   - If `f32`, tensors are transmitted directly.
-  - If `q8_0`, `q4_0` or `q2_k`, tensors are quantized before transmission.
-  - If `f32_sparsity`, tensors are pruned before transmission.
+  - If other type, tensors are compressed before transmission.
 
 - **Receive path**
 
   - Metadata indicates whether the payload is raw or quantized.
-  - Quantized payloads are automatically dequantized to float32.
-  - Sparse payloads are automatically decompressed to float32, with pruned values restored as zeros.
+  - Compressed payloads are automatically dequantized to float32.
 
 This design ensures that each rank manages compression only for its own outputs, while reception remains transparent.
 
