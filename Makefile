@@ -271,7 +271,7 @@ MK_CXXFLAGS  = -std=c++11 -fPIC
 MK_NVCCFLAGS = -std=c++11
 
 MK_CPPFLAGS += -isystem /usr/local/include
-MK_LDFLAGS  += -L/usr/local/lib -lzmq
+MK_LDFLAGS  += -L/usr/local/lib -lzmq -lbitsqz
 
 ifeq ($(UNAME_S),Darwin)
     MK_CPPFLAGS += -isystem /opt/homebrew/include
@@ -955,9 +955,6 @@ OBJ_LLAMA = \
 	src/unicode.o \
 	src/unicode-data.o \
 	src/network-utils.o \
-	src/quantization.o \
-	src/sparsity.o \
-	src/k_quantization.o \
 
 OBJ_COMMON = \
 	common/profiler.o \
@@ -1161,8 +1158,6 @@ src/llama.o: \
 	src/llama-sampling.h \
 	src/unicode.h \
 	src/network-utils.h \
-	src/quantization.h \
-	src/sparsity.h \
 	include/llama.h \
 	ggml/include/ggml-cuda.h \
 	ggml/include/ggml-metal.h \
@@ -1176,21 +1171,6 @@ src/llama-vocab.o: \
 	src/llama-vocab.h \
 	src/llama-impl.h \
 	include/llama.h
-	$(CXX) $(CXXFLAGS) -c $< -o $@
-
-src/quantization.o: \
-	src/quantization.cpp \
-	src/quantization.h 
-	$(CXX) $(CXXFLAGS) -c $< -o $@
-
-src/sparsity.o: \
-	src/sparsity.cpp \
-	src/sparsity.h 
-	$(CXX) $(CXXFLAGS) -c $< -o $@ -fopenmp
-
-src/k_quantization.o: \
-	src/k_quantization.cpp \
-	src/k_quantization.h 
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 
 src/llama-grammar.o: \

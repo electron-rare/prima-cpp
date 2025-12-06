@@ -401,6 +401,7 @@ extern "C" {
         const char * comm_datatype;
 
         int comm_sparse_percentage;
+        int comm_compression_threshold;
     };
 
     // model quantization parameters

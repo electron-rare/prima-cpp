@@ -118,6 +118,7 @@ Before using this project, ensure you have the following dependencies installed:
 - zmq >= 4.3.2 (used for cross-device communication)
 - HiGHS >= 1.9.0 (used for automatic workload distribution)
 - CUDA (optional, if you have a GPU)
+- BitSqueeze >= 0.1.1 (used for communication compression)
 
 **Linux (e.g., Ubuntu):**
 
@@ -135,6 +136,17 @@ mkdir build && cd build
 cmake ..
 make -j$(nproc)
 sudo make install
+sudo ldconfig
+```
+
+For BitSqueeze, download and install from [source](https://github.com/DandinPower/BitSqueeze):
+
+```bash
+git clone https://github.com/DandinPower/BitSqueeze.git
+cd BitSqueeze
+cmake -B build_shared -DBUILD_SHARED_LIBS=ON -DCMAKE_BUILD_TYPE=Release
+cmake --build build_shared --config Release
+sudo cmake --install build_shared
 sudo ldconfig
 ```
 

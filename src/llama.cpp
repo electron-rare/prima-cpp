@@ -13,9 +13,7 @@
 #include "profiler.h"
 #include "network-utils.h"
 
-#include "quantization.h"
-#include "sparsity.h"
-#include "k_quantization.h"
+#include "bitsqueeze.h"
 
 #ifdef GGML_USE_RPC
 #  include "ggml-rpc.h"
@@ -2721,6 +2719,7 @@ struct llama_cparams {
     bool enable_comm_compute_log;
     const char * comm_datatype;
     float comm_sparse_percentage;
+    int comm_compression_threshold;
 };
 
 // TODO: separate into "llama_layer_enc" and "llama_layer_dec"
@@ -18139,14 +18138,38 @@ static int llama_recv_meta(zmq::socket_t & socket, struct sync_meta * meta) {
     return 0;
 }
 
-static void llama_send_tensors(zmq::socket_t & socket, struct llama_ubatch * ubatch, struct input_tensors * tensors, const char * dump_folder = nullptr, const bool enable_comm_compute_log = true, const int my_rank = 0, const char * comm_datatype = nullptr, int comm_sparse_percentage=100) {
+static inline bsq_method_t convert_comm_datatype_string_to_enum(std::string comm_datatype_string) {
+    if (comm_datatype_string == "q8_0") return Q8_0;
+    else if (comm_datatype_string == "q4_0") return Q4_0;
+    else if (comm_datatype_string == "q2_k") return Q2_K;
+    else if (comm_datatype_string == "bf16") return BF16;
+    else if (comm_datatype_string == "fp16") return FP16;
+    else if (comm_datatype_string == "fp8") return FP8;
+    else if (comm_datatype_string == "fp4") return FP4;
+    else if (comm_datatype_string == "mxfp8") return MXFP8;
+    else if (comm_datatype_string == "mxfp4") return MXFP4;
+    else if (comm_datatype_string == "nvfp4") return NVFP4;
+    else if (comm_datatype_string == "nf4") return NF4;
+    else if (comm_datatype_string == "nf4_dq") return NF4_DQ;
+    else if (comm_datatype_string == "iq2_xxs") return IQ2_XXS;
+    else if (comm_datatype_string == "iq2_xs") return IQ2_XS;
+    else if (comm_datatype_string == "iq2_s") return IQ2_S;
+    else if (comm_datatype_string == "f32_sparsity") return TOPK;
+    else return BSQ_INVALID;
+}
+
+static void llama_send_tensors(zmq::socket_t & socket, struct llama_ubatch * ubatch, struct input_tensors * tensors, const char * dump_folder = nullptr, const bool enable_comm_compute_log = true, const int my_rank = 0, const char * comm_datatype = nullptr, int comm_sparse_percentage=100, int comm_compression_threshold=0) {
     g_llama_send_tensors_counts++;
     try {
         std::vector<zmq::message_t> send_msgs;
         int64_t num_elements = tensors->sub_gf_out->ne[0] * tensors->sub_gf_out->ne[1];
         int64_t float_element_size   = num_elements * sizeof(float);
         
-        std::string comm_datatype_string = std::string(comm_datatype);
+        std::string comm_datatype_string = comm_datatype ? std::string(comm_datatype) : "f32";
+        int64_t compression_threshold = std::max<int64_t>(0, comm_compression_threshold);
+        if (tensors->sub_gf_out->ne[1] < compression_threshold) {
+            comm_datatype_string = "f32";
+        }
         std::string start_compute_time = "";
         std::string end_compute_time = "";
         int64_t buf_size = 0;
@@ -18154,60 +18177,10 @@ static void llama_send_tensors(zmq::socket_t & socket, struct llama_ubatch * uba
         if (comm_datatype_string == "f32") {            
             buf_size = float_element_size;
             send_msgs.emplace_back("sub_gf_out", strlen("sub_gf_out"));
-            send_msgs.emplace_back("normal", strlen("normal"));
+            send_msgs.emplace_back("f32", strlen("f32"));
             send_msgs.emplace_back(tensors->sub_gf_out->ne, sizeof(tensors->sub_gf_out->ne));
             send_msgs.emplace_back(ubatch->backend_embd, buf_size);
             send_msgs.emplace_back(&buf_size, sizeof(int64_t));
-        } else if (comm_datatype_string == "q8_0" || comm_datatype_string == "q4_0") {
-            int qtype = (comm_datatype_string == "q8_0") ? 0 : 1;
-
-            start_compute_time = get_iso8601_ms_timestamp();
-            quantized_array_t *quantized_array = NULL;
-            if (quantize(ubatch->backend_embd, num_elements, qtype,
-                         &quantized_array) || !quantized_array) {
-                LLAMA_LOG_INFO("Failed to allocate space or do quantization\n");
-                return;
-            }
-
-            end_compute_time = get_iso8601_ms_timestamp();
-            buf_size = get_quantized_array_size(quantized_array);
-
-            send_msgs.emplace_back("sub_gf_out", strlen("sub_gf_out"));
-            send_msgs.emplace_back("quantized", strlen("quantized"));
-            send_msgs.emplace_back(tensors->sub_gf_out->ne,
-                                   sizeof(tensors->sub_gf_out->ne));
-            send_msgs.emplace_back(quantized_array, buf_size);
-            send_msgs.emplace_back(&buf_size, sizeof(buf_size));
-
-            free_quantized_array(quantized_array);
-            if (enable_comm_compute_log) {
-                LLAMA_LOG_INFO("[%d][%s][compute][start][send_tensors][quantize]\n", my_rank, start_compute_time.c_str());
-                LLAMA_LOG_INFO("[%d][%s][compute][end][send_tensors][quantize]\n", my_rank, end_compute_time.c_str());
-            }
-        } else if (comm_datatype_string == "q2_k") {
-            start_compute_time = get_iso8601_ms_timestamp();
-            quantized_array_q2_k_t *quantized_array = NULL;
-            if (k_quantize(ubatch->backend_embd, num_elements,
-                         &quantized_array) || !quantized_array) {
-                LLAMA_LOG_INFO("Failed to allocate space or do quantization\n");
-                return;
-            }
-
-            end_compute_time = get_iso8601_ms_timestamp();
-            buf_size = get_quantized_q2_k_array_size(quantized_array);
-
-            send_msgs.emplace_back("sub_gf_out", strlen("sub_gf_out"));
-            send_msgs.emplace_back("k_quantized", strlen("k_quantized"));
-            send_msgs.emplace_back(tensors->sub_gf_out->ne,
-                                   sizeof(tensors->sub_gf_out->ne));
-            send_msgs.emplace_back(quantized_array, buf_size);
-            send_msgs.emplace_back(&buf_size, sizeof(buf_size));
-
-            free_quantized_q2_k_array(quantized_array);
-            if (enable_comm_compute_log) {
-                LLAMA_LOG_INFO("[%d][%s][compute][start][send_tensors][k_quantize]\n", my_rank, start_compute_time.c_str());
-                LLAMA_LOG_INFO("[%d][%s][compute][end][send_tensors][k_quantize]\n", my_rank, end_compute_time.c_str());
-            }
         } else if (comm_datatype_string == "f32_sparsity") {
             if (comm_sparse_percentage < 1 && comm_sparse_percentage > 100) {
                 fprintf(stderr, "Sparse percentage %d should between 1~100\n", comm_sparse_percentage);
@@ -18215,33 +18188,63 @@ static void llama_send_tensors(zmq::socket_t & socket, struct llama_ubatch * uba
             }
             
             float sparse_ratio = (float) comm_sparse_percentage / 100;
-            sparse_array_t *sparse_array = NULL;
-
+            
+            bitsqueeze_buffer_t *buf = NULL;
             start_compute_time = get_iso8601_ms_timestamp();
-            if (compress(ubatch->backend_embd, tensors->sub_gf_out->ne[1], tensors->sub_gf_out->ne[0], sparse_ratio, &sparse_array)) {
-                fprintf(stderr, "compress failed for ratio %.2f\n", sparse_ratio);
-                free_sparse_array(sparse_array);
-                return;
-            }
+            int c_res = bsq_compress_2d(ubatch->backend_embd, tensors->sub_gf_out->ne[1], tensors->sub_gf_out->ne[0], sparse_ratio, TOPK, &buf);
             end_compute_time = get_iso8601_ms_timestamp();
-            buf_size = get_sparse_array_size(sparse_array);
+
+            if (c_res || !buf) {
+                fprintf(stderr, "TOPK compress failed for array, ratio %.2f\n", sparse_ratio);
+                bsq_free(buf);
+                return ;
+            }
+            buf_size = bsq_get_packed_size(buf);
 
             send_msgs.emplace_back("sub_gf_out", strlen("sub_gf_out"));
-            send_msgs.emplace_back("sparse", strlen("sparse"));
+            send_msgs.emplace_back("f32_sparsity", strlen("f32_sparsity"));
             send_msgs.emplace_back(tensors->sub_gf_out->ne,
                                    sizeof(tensors->sub_gf_out->ne));
-            send_msgs.emplace_back(sparse_array, buf_size);
+            send_msgs.emplace_back(buf, buf_size);
             send_msgs.emplace_back(&buf_size, sizeof(buf_size));
 
-            free_sparse_array(sparse_array);
+            bsq_free(buf);
             if (enable_comm_compute_log) {
-                LLAMA_LOG_INFO("[%d][%s][compute][start][send_tensors][sparse_compress]\n", my_rank, start_compute_time.c_str());
-                LLAMA_LOG_INFO("[%d][%s][compute][end][send_tensors][sparse_compress]\n", my_rank, end_compute_time.c_str());
+                LLAMA_LOG_INFO("[%d][%s][compute][start][send_tensors][compress]\n", my_rank, start_compute_time.c_str());
+                LLAMA_LOG_INFO("[%d][%s][compute][end][send_tensors][compress]\n", my_rank, end_compute_time.c_str());
             }
-
         } else {
-            LLAMA_LOG_INFO("Unsupported communication type = %s\n", comm_datatype_string);   
-            return;
+            bsq_method_t bsq_method = convert_comm_datatype_string_to_enum(comm_datatype_string);
+            if (bsq_method != BSQ_INVALID) {
+                bitsqueeze_buffer_t *buf = NULL;
+                start_compute_time = get_iso8601_ms_timestamp();
+                int c_res = bsq_compress_1d(ubatch->backend_embd, num_elements, bsq_method, &buf);
+                end_compute_time = get_iso8601_ms_timestamp();
+
+                if (c_res || !buf) {
+                    fprintf(stderr, "%s compress failed on array \n", comm_datatype_string.c_str());
+                    bsq_free(buf);
+                    return;
+                }
+                buf_size = bsq_get_packed_size(buf);
+
+                send_msgs.emplace_back("sub_gf_out", strlen("sub_gf_out"));
+                send_msgs.emplace_back(comm_datatype, strlen(comm_datatype));
+                send_msgs.emplace_back(tensors->sub_gf_out->ne,
+                                    sizeof(tensors->sub_gf_out->ne));
+                send_msgs.emplace_back(buf, buf_size);
+                send_msgs.emplace_back(&buf_size, sizeof(buf_size));
+
+                bsq_free(buf);
+                if (enable_comm_compute_log) {
+                    LLAMA_LOG_INFO("[%d][%s][compute][start][send_tensors][compress]\n", my_rank, start_compute_time.c_str());
+                    LLAMA_LOG_INFO("[%d][%s][compute][end][send_tensors][compress]\n", my_rank, end_compute_time.c_str());
+                } 
+
+            } else {
+                LLAMA_LOG_INFO("Unsupported communication type = %s\n", comm_datatype_string.c_str());
+                return;
+            }
         }
 
         if (tensors->inp_pos) {
@@ -18249,7 +18252,7 @@ static void llama_send_tensors(zmq::socket_t & socket, struct llama_ubatch * uba
             buf_size = tensors->inp_pos->ne[0] * sizeof(int32_t);
             
             send_msgs.emplace_back("inp_pos", strlen("inp_pos"));
-            send_msgs.emplace_back("normal", strlen("normal"));
+            send_msgs.emplace_back("f32", strlen("f32"));
             send_msgs.emplace_back(tensors->inp_pos->ne, sizeof(tensors->inp_pos->ne[0]));
             send_msgs.emplace_back(ubatch->pos, buf_size);
             send_msgs.emplace_back(&zero, sizeof(int64_t));
@@ -18292,62 +18295,32 @@ static void llama_recv_tensors(zmq::socket_t & socket, struct llama_ubatch * uba
             int64_t num_elements = dims[0] * dims[1];
             int64_t float_element_size   = num_elements * sizeof(float);
 
-            if (comm_type == "quantized") {
-                quantized_array_t *quantized_array = load_quantized_array_from_buffer(data_msg.data(), *buf_size);
-                if (!quantized_array) {
-                    LLAMA_LOG_INFO("Failed to load quantized array from buffer.\n");   
-                    return;
-                }
-
-                std::string start_compute_time = get_iso8601_ms_timestamp();
-                dequantize(quantized_array, batch_embd); 
-                std::string end_compute_time = get_iso8601_ms_timestamp();
-
-                free_quantized_array(quantized_array);
-
-                if (enable_comm_compute_log) {
-                    LLAMA_LOG_INFO("[%d][%s][compute][start][recv_tensors][dequantize]\n", my_rank, start_compute_time.c_str());
-                    LLAMA_LOG_INFO("[%d][%s][compute][end][recv_tensors][dequantize]\n", my_rank, end_compute_time.c_str());
-                }
-            }
-            else if (comm_type == "k_quantized") {
-                quantized_array_q2_k_t *quantized_array = load_quantized_q2_k_array_from_buffer(data_msg.data(), *buf_size);
-                if (!quantized_array) {
-                    LLAMA_LOG_INFO("Failed to load quantized array from buffer.\n");   
-                    return;
-                }
-
-                std::string start_compute_time = get_iso8601_ms_timestamp();
-                k_dequantize(quantized_array, batch_embd); 
-                std::string end_compute_time = get_iso8601_ms_timestamp();
-
-                free_quantized_q2_k_array(quantized_array);
-
-                if (enable_comm_compute_log) {
-                    LLAMA_LOG_INFO("[%d][%s][compute][start][recv_tensors][k_dequantize]\n", my_rank, start_compute_time.c_str());
-                    LLAMA_LOG_INFO("[%d][%s][compute][end][recv_tensors][k_dequantize]\n", my_rank, end_compute_time.c_str());
-                }
-            }
-            else if (comm_type == "sparse") {
-                sparse_array_t *sparse_array = load_sparse_array_from_buffer(data_msg.data(), *buf_size);
-                if (!sparse_array) {
-                    LLAMA_LOG_INFO("Failed to load sparse array from buffer.\n");   
-                    return;
-                }
-
-                std::string start_compute_time = get_iso8601_ms_timestamp();
-                decompress(sparse_array, batch_embd);
-                std::string end_compute_time = get_iso8601_ms_timestamp();
-
-                free_sparse_array(sparse_array);
-
-                if (enable_comm_compute_log) {
-                    LLAMA_LOG_INFO("[%d][%s][compute][start][recv_tensors][sparse_decompress]\n", my_rank, start_compute_time.c_str());
-                    LLAMA_LOG_INFO("[%d][%s][compute][end][recv_tensors][sparse_decompress]\n", my_rank, end_compute_time.c_str());
-                }
+            if (comm_type == "f32") {
+                std::memcpy(batch_embd, data_msg.data(), float_element_size);
             }
             else {
-                std::memcpy(batch_embd, data_msg.data(), float_element_size);
+                bsq_method_t bsq_method = convert_comm_datatype_string_to_enum(comm_type);
+                if (bsq_method != BSQ_INVALID) {
+                    bitsqueeze_buffer_t *buf = load_bsq_from_buffer(data_msg.data(), *buf_size);
+                    if (!buf) {
+                        LLAMA_LOG_INFO("Failed to load bsq array from buffer.\n");   
+                        return;
+                    }
+
+                    std::string start_compute_time = get_iso8601_ms_timestamp();
+                    bsq_decompress(buf, batch_embd, num_elements); 
+                    std::string end_compute_time = get_iso8601_ms_timestamp();
+
+                    bsq_free(buf);
+
+                    if (enable_comm_compute_log) {
+                        LLAMA_LOG_INFO("[%d][%s][compute][start][recv_tensors][decompress]\n", my_rank, start_compute_time.c_str());
+                        LLAMA_LOG_INFO("[%d][%s][compute][end][recv_tensors][decompress]\n", my_rank, end_compute_time.c_str());
+                    }
+                } else {
+                    LLAMA_LOG_INFO("Unsupported communication type = %s\n", comm_type);   
+                    return;
+                }
             }
             
             if (dump_folder && strlen(dump_folder) > 0) {
@@ -18878,7 +18851,7 @@ static int llama_decode_internal(
                 struct input_tensors tensors = {sub_gf_out, lctx.inp_pos};
                 const bool is_to_master = my_rank != 0 && is_last_l;
                 zmq::socket_t * s = is_to_master ? lctx.master_socket : lctx.send_socket;
-                llama_send_tensors(*s, &ubatch, &tensors, lctx.cparams.dump_folder, lctx.cparams.enable_comm_compute_log, my_rank, lctx.cparams.comm_datatype, lctx.cparams.comm_sparse_percentage);
+                llama_send_tensors(*s, &ubatch, &tensors, lctx.cparams.dump_folder, lctx.cparams.enable_comm_compute_log, my_rank, lctx.cparams.comm_datatype, lctx.cparams.comm_sparse_percentage, lctx.cparams.comm_compression_threshold);
                 if (lctx.cparams.enable_comm_compute_log) {
                     LLAMA_LOG_INFO("[%d][%s][comm][end][send_tensors][sbatch_tokens: %lu, ubatch_tokens: %u, send the result to the next node or the master]\n", my_rank, get_iso8601_ms_timestamp().c_str(), lctx.sbatch.n_tokens, ubatch.n_tokens);
                 }
@@ -20638,7 +20611,9 @@ struct llama_context_params llama_context_default_params() {
         /*.abort_callback_data         =*/ nullptr,
         /*.dump_folder                 =*/ nullptr,
         /*.enable_comm_compute_log     =*/ false,
-        /*.comm_datatype                 =*/ nullptr,
+        /*.comm_datatype               =*/ nullptr,
+        /*.comm_sparse_percentage      =*/ 100,
+        /*.comm_compression_threshold  =*/ 0,
     };
 
     return result;
@@ -21285,6 +21260,7 @@ struct llama_context * llama_new_context_with_model(
     ctx->cparams.enable_comm_compute_log = params.enable_comm_compute_log;
     ctx->cparams.comm_datatype = params.comm_datatype;
     ctx->cparams.comm_sparse_percentage = params.comm_sparse_percentage;
+    ctx->cparams.comm_compression_threshold = params.comm_compression_threshold;
     ctx->cparams.original_next_rank = (params.rank + 1) % params.n_world;
     
     auto &hparams = model->hparams;

@@ -383,6 +383,7 @@ struct gpt_params {
     std::string comm_datatype = "f32"; // data type for communication
 
     int comm_sparse_percentage = 100;
+    int comm_compression_threshold = 0; // minimum element count before applying communication compression
 };
 
 // call once at the start of a program if it uses libcommon

@@ -2116,6 +2116,7 @@ struct llama_context_params llama_context_params_from_gpt_params(const gpt_param
     }
 
     cparams.comm_sparse_percentage = params.comm_sparse_percentage;
+    cparams.comm_compression_threshold = params.comm_compression_threshold;
 
     cparams.n_ctx             = params.n_ctx;
     cparams.n_predict         = params.n_predict;
