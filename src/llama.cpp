@@ -18786,13 +18786,16 @@ static int llama_decode_internal(
             ubatch.activate_output = (my_rank == 0 && is_out_embd);
             GGML_ASSERT(!(ubatch.activate_input && ubatch.activate_output));
             
+            std::string start_h2d_time = get_iso8601_ms_timestamp();
             llama_set_inputs(lctx, ubatch);
+            std::string end_h2d_time = get_iso8601_ms_timestamp();
 
             std::string start_compute_time = get_iso8601_ms_timestamp();
             {   // compute graph
                 timer(llama_graph_compute);
                 llama_graph_compute(lctx, sub_gf, lctx.sched[i], n_threads, threadpool); 
             }
+            ggml_backend_sched_synchronize(lctx.sched[i]);  // sync before end time
             std::string end_compute_time = get_iso8601_ms_timestamp();
     
             sub_gf_out = ggml_graph_node(sub_gf, -1);
@@ -18808,10 +18811,6 @@ static int llama_decode_internal(
             } else if (strncmp(sub_gf_out->name, "l_out", 5) == 0) {
                 snprintf(layer_desc, sizeof(layer_desc), "transformer_blocks");
                 log_layer = true;
-            }
-            if (log_layer && lctx.cparams.enable_comm_compute_log) {
-                LLAMA_LOG_INFO("[%d][%s][compute][start][%s][sbatch_tokens: %lu, ubatch_tokens: %u]\n", my_rank, start_compute_time.c_str(), layer_desc, lctx.sbatch.n_tokens, ubatch.n_tokens);
-                LLAMA_LOG_INFO("[%d][%s][compute][end][%s][sbatch_tokens: %lu, ubatch_tokens: %u]\n", my_rank, end_compute_time.c_str(), layer_desc, lctx.sbatch.n_tokens, ubatch.n_tokens);
             }
 
             is_output  = strcmp(sub_gf_out->name, "result_output") == 0;
@@ -18840,8 +18839,20 @@ static int llama_decode_internal(
             ggml_backend_t backend  = ggml_backend_sched_get_tensor_backend(lctx.sched[i], sub_gf_out);
             GGML_ASSERT(buf_size <= ggml_nbytes(sub_gf_out));
             GGML_ASSERT(backend  != nullptr);
+
+            std::string start_d2h_time = get_iso8601_ms_timestamp();
             ggml_backend_tensor_get_async(backend, sub_gf_out, embd_buf, 0, buf_size);
             ggml_backend_sched_synchronize(lctx.sched[i]);
+            std::string end_d2h_time = get_iso8601_ms_timestamp();
+
+            if (log_layer && lctx.cparams.enable_comm_compute_log) {
+                LLAMA_LOG_INFO("[%d][%s][h2d][start][%s]\n", my_rank, start_h2d_time.c_str(), layer_desc);
+                LLAMA_LOG_INFO("[%d][%s][h2d][end][%s]\n", my_rank, end_h2d_time.c_str(), layer_desc);
+                LLAMA_LOG_INFO("[%d][%s][compute][start][%s]\n", my_rank, start_compute_time.c_str(), layer_desc);
+                LLAMA_LOG_INFO("[%d][%s][compute][end][%s]\n", my_rank, end_compute_time.c_str(), layer_desc);
+                LLAMA_LOG_INFO("[%d][%s][d2h][start][%s]\n", my_rank, start_d2h_time.c_str(), layer_desc);
+                LLAMA_LOG_INFO("[%d][%s][d2h][end][%s]\n", my_rank, end_d2h_time.c_str(), layer_desc);
+            }
 
             // send the result to the next node or the master
             if (!(n_world == 1 || (my_rank == 0 && is_last_l))) {
