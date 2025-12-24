@@ -25,13 +25,15 @@ typedef enum {
     IQ2_XXS = 13,
     IQ2_XS = 14,
     IQ2_S = 15,
+    Q2_K_FAST = 16,
+    TOPK_IM = 17,
 } bsq_method_t;
 
 typedef struct {
     uint64_t num_elements;    /* for 1D formats */
     uint16_t num_tokens;      /* for 2D sparsity */
     uint16_t num_features;    /* for 2D sparsity */
-    float    sparse_ratio;    /* only meaningful for TOPK */
+    float    sparse_ratio;    /* only meaningful for TOPK, TOPK_IM */
 } bsq_shape_t;
 
 typedef struct bitsqueeze_buffer {
@@ -50,9 +52,14 @@ int bsq_compress_2d(const float *src,
                     uint16_t num_features,
                     float sparse_ratio,
                     bsq_method_t method,
-                    bitsqueeze_buffer_t **out);
+                    bitsqueeze_buffer_t **out,
+                    const float *im);
 
 int bsq_decompress(const bitsqueeze_buffer_t *buf,
+                   float *dst,
+                   uint64_t dst_num_elements);
+
+int bsq_apply(const bitsqueeze_buffer_t *buf,
                    float *dst,
                    uint64_t dst_num_elements);
 

@@ -2120,7 +2120,7 @@ gpt_params_context gpt_params_parser_init(gpt_params & params, llama_example ex,
     ));
     add_opt(llama_arg(
         {"--comm-datatype"}, "TYPE",
-        format("Datatype for communication, currently support f32, bf16, fp16, q8_0, q4_0, q2_k, iq2_s, iq2_xs, iq2_xxs, fp8, fp4, mxfp8, mxfp4, nvfp4, nf4, nf4_dq, or f32_sparsity (default: %s)", params.comm_datatype.c_str()),
+        format("Datatype for communication, currently support f32, bf16, fp16, q8_0, q4_0, q2_k, q2_k_fast, iq2_s, iq2_xs, iq2_xxs, fp8, fp4, mxfp8, mxfp4, nvfp4, nf4, nf4_dq, or f32_sparsity (default: %s)", params.comm_datatype.c_str()),
         [](gpt_params & params, const std::string & value) {
             params.comm_datatype = value;
         }

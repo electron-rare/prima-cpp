@@ -258,7 +258,7 @@ This feature allows each rank to specify the data type used when sending tensors
 A new CLI argument (`--comm_datatype TYPE`) sets the communication data type. Supported values:
 
 - f32 (default, no compression)
-- integer based (q8_0, q4_0, q2_k, iq2_s, iq2_xs, iq2_xxs)
+- integer based (q8_0, q4_0, q2_k, q2_k_fast, iq2_s, iq2_xs, iq2_xxs)
 - float based (f32, bf16, fp16, fp8, fp4, mxfp8, mxfp4, nvfp4, nf4, nf4_dq)
 - f32_sparsity (no quantization, but allows `--comm_sparse_percentage` to select the top-k features for each token based on the specified sparsity percentage)
 

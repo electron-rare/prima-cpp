@@ -3001,6 +3001,9 @@ struct llama_model {
     llama_hparams hparams = {};
     llama_vocab   vocab;
 
+    // RMS Aware Add: Add next node first layer attn_norm ggml tensor 
+    struct ggml_tensor * next_node_first_attn_norm = nullptr;
+    
     // TODO: should init all tensors to nullptr
     struct ggml_tensor * tok_embd   = nullptr;
     struct ggml_tensor * type_embd  = nullptr;
@@ -3939,6 +3942,15 @@ static bool this_layer_is_mine(
         }
         rank = (rank + 1) % n_world;
     }
+}
+
+// rms aware add: add a function to count next node first layer
+static uint32_t get_next_node_first_layer_id(uint32_t n_world, uint32_t my_rank, const uint32_t * n_layer_window) {
+    uint32_t cumulative_layers = 0;
+    for (uint32_t start_rank=0; start_rank < my_rank; start_rank++){
+        cumulative_layers += n_layer_window[start_rank];
+    }
+    return cumulative_layers;
 }
 
 static int32_t map_layer_to_local_id(
@@ -7713,6 +7725,11 @@ static bool llm_load_tensors_impl(
         }
     }
 
+    // rms aware todo: remember to check flag
+    // rms aware add: calculate the 
+    uint32_t next_node_first_layer_idx = 0;
+    next_node_first_layer_idx = get_next_node_first_layer_id(n_world, my_rank, n_layer_window);
+
     // assign the input and output layers on CPU by default
     if (my_rank == 0) {
         model.buft_input  = llama_default_buffer_type_cpu(model, true);
@@ -7745,6 +7762,11 @@ static bool llm_load_tensors_impl(
 
     // for moe merged tensors
     ctx_size += ggml_tensor_overhead() * my_layers * 3;
+
+    // rms aware todo: need to check enable next_node_aware or not
+    // rms aware add: make sure it has cpu ctx
+    buft_layer_count[llama_default_buffer_type_cpu(model, true)]++;
+    ctx_size += ggml_tensor_overhead();
 
     std::map<ggml_backend_buffer_type_t, ggml_context *> ctx_map;
     for (auto & it : buft_layer_count) {
@@ -7800,6 +7822,22 @@ static bool llm_load_tensors_impl(
         model.layers.resize(my_layers);
 
         const auto tn = LLM_TN(model.arch);
+        // rms aware todo: need to check enable next_node_aware or not and ignore if the comm_datatype is f32
+        // rms aware add: load tensor
+        if (model.arch != LLM_ARCH_QWEN2 and model.arch != LLM_ARCH_QWEN) {
+            throw std::runtime_error("Unsupported model arch for rms_aware_importance_matrix, currently only support Qwen Family");
+        }
+        ggml_context * ctx_cpu = ctx_map.at(llama_default_buffer_type_cpu(model, true));
+        model.next_node_first_attn_norm = ml.create_tensor(ctx_cpu, tn(LLM_TENSOR_ATTN_NORM, "weight", next_node_first_layer_idx), {n_embd}, 0, true);
+        if (model.next_node_first_attn_norm &&
+            model.next_node_first_attn_norm->type != GGML_TYPE_F32) {
+            throw std::runtime_error(format(
+                "next_node_first_attn_norm has type %s, expected f32",
+                ggml_type_name(model.next_node_first_attn_norm->type)));
+        }
+        LLAMA_LOG_INFO("[rms_aware_importance_matrix] Successfully load next node first layer (layer_id=%d) attn normalization weight\n", next_node_first_layer_idx);
+
+
         switch (model.arch) {
             case LLM_ARCH_LLAMA:
             case LLM_ARCH_REFACT:
@@ -18142,6 +18180,7 @@ static inline bsq_method_t convert_comm_datatype_string_to_enum(std::string comm
     if (comm_datatype_string == "q8_0") return Q8_0;
     else if (comm_datatype_string == "q4_0") return Q4_0;
     else if (comm_datatype_string == "q2_k") return Q2_K;
+    else if (comm_datatype_string == "q2_k_fast") return Q2_K_FAST;
     else if (comm_datatype_string == "bf16") return BF16;
     else if (comm_datatype_string == "fp16") return FP16;
     else if (comm_datatype_string == "fp8") return FP8;
@@ -18158,7 +18197,94 @@ static inline bsq_method_t convert_comm_datatype_string_to_enum(std::string comm
     else return BSQ_INVALID;
 }
 
-static void llama_send_tensors(zmq::socket_t & socket, struct llama_ubatch * ubatch, struct input_tensors * tensors, const char * dump_folder = nullptr, const bool enable_comm_compute_log = true, const int my_rank = 0, const char * comm_datatype = nullptr, int comm_sparse_percentage=100, int comm_compression_threshold=0) {
+static void get_rms_norm_aware_importance_matrix(
+    const float *float_array,                      // a: [num_tokens * num_features]
+    const float *next_layer_attn_norm_weight,      // b: [num_features]
+    uint16_t num_tokens,
+    uint16_t num_features,
+    float **importance_matrix)                     // out: [num_tokens * num_features]
+{
+    if (!importance_matrix) return;
+    *importance_matrix = NULL;
+
+    if (!float_array || !next_layer_attn_norm_weight) return;
+    if (num_tokens == 0 || num_features == 0) return;
+
+    size_t num_elements = (size_t)num_tokens * (size_t)num_features;
+    if (num_elements / (size_t)num_features != (size_t)num_tokens) return; // overflow guard
+
+    float *temp_importance_matrix = (float *)calloc(num_elements, sizeof(float));
+    if (!temp_importance_matrix) return;
+
+    // Precompute b_k^2 once (b is shared across tokens).
+    float *b_sq = (float *)malloc((size_t)num_features * sizeof(float));
+    if (!b_sq) {
+        free(temp_importance_matrix);
+        return;
+    }
+    for (uint16_t k = 0; k < num_features; ++k) {
+        float bk = next_layer_attn_norm_weight[k];
+        b_sq[k] = bk * bk;
+    }
+
+    // set this to match model's RMSNorm epsilon.
+    const float eps = 1e-6f;
+
+    const float n = (float)num_features;
+    const float inv_n = 1.0f / n;
+    const float inv_n2 = inv_n * inv_n;
+
+    for (uint16_t t = 0; t < num_tokens; ++t) {
+        uint32_t base = (uint32_t)t * (uint32_t)num_features;
+
+        // Pass 1: compute r^2 and S_w for this token
+        float sum_a2 = 0.0f;
+        float S_w = 0.0f;  // S_w = sum_i (b_i a_i)^2 = sum_i (b_i^2 a_i^2)
+
+        for (uint16_t j = 0; j < num_features; ++j) {
+            float aj = float_array[base + j];
+            float aj2 = aj * aj;
+            sum_a2 += aj2;
+            S_w += b_sq[j] * aj2;
+        }
+
+        // r^2 = mean(a^2) (+ eps if matching real RMSNorm)
+        float r2 = sum_a2 * inv_n + eps;
+        if (r2 <= 0.0f) r2 = (eps > 0.0f) ? eps : 1e-12f; // safety fallback
+
+        // We need 1/r^2, 1/r^4, 1/r^6
+        float inv_r2 = 1.0f / r2;
+        float inv_r4 = inv_r2 * inv_r2;
+        float inv_r6 = inv_r4 * inv_r2;
+
+        // Token-specific constants to reduce per-k work
+        float term2_factor = (-2.0f * inv_n) * inv_r4; // multiplies (b_k^2 * a_k^2)
+        float term3_factor = (inv_n2 * inv_r6) * S_w;  // multiplies (a_k^2)
+
+        // Pass 2: compute importance for each feature k
+        for (uint16_t k = 0; k < num_features; ++k) {
+            float ak = float_array[base + k];
+            float ak2 = ak * ak;
+            float bk2 = b_sq[k];
+
+            // imp_k = b_k^2/r^2 - 2 b_k^2 a_k^2/(n r^4) + a_k^2 S_w/(n^2 r^6)
+            float imp = (bk2 * inv_r2)
+                      + (bk2 * ak2 * term2_factor)
+                      + (ak2 * term3_factor);
+
+            // True value is >= 0, but float roundoff can produce tiny negatives.
+            if (imp < 0.0f) imp = 0.0f;
+
+            // temp_importance_matrix[base + k] = imp;
+            temp_importance_matrix[base + k] = imp * ak2;
+        }
+    }
+
+    free(b_sq);
+    *importance_matrix = temp_importance_matrix;
+}
+
+static void llama_send_tensors(zmq::socket_t & socket, struct llama_ubatch * ubatch, struct input_tensors * tensors, const char * dump_folder = nullptr, const bool enable_comm_compute_log = true, const int my_rank = 0, const char * comm_datatype = nullptr, int comm_sparse_percentage=100, int comm_compression_threshold=0, const float * next_layer_attn_norm_weight = nullptr) {
     g_llama_send_tensors_counts++;
     try {
         std::vector<zmq::message_t> send_msgs;
@@ -18190,15 +18316,27 @@ static void llama_send_tensors(zmq::socket_t & socket, struct llama_ubatch * uba
             float sparse_ratio = (float) comm_sparse_percentage / 100;
             
             bitsqueeze_buffer_t *buf = NULL;
+            float *im_array = NULL;
             start_compute_time = get_iso8601_ms_timestamp();
-            int c_res = bsq_compress_2d(ubatch->backend_embd, tensors->sub_gf_out->ne[1], tensors->sub_gf_out->ne[0], sparse_ratio, TOPK, &buf);
-            end_compute_time = get_iso8601_ms_timestamp();
-
-            if (c_res || !buf) {
-                fprintf(stderr, "TOPK compress failed for array, ratio %.2f\n", sparse_ratio);
-                bsq_free(buf);
-                return ;
+            if (next_layer_attn_norm_weight != nullptr) {
+                // enable TOPK_IM
+                get_rms_norm_aware_importance_matrix(ubatch->backend_embd, next_layer_attn_norm_weight, tensors->sub_gf_out->ne[1], tensors->sub_gf_out->ne[0], &im_array);
+                int c_res = bsq_compress_2d(ubatch->backend_embd, tensors->sub_gf_out->ne[1], tensors->sub_gf_out->ne[0], sparse_ratio, TOPK_IM, &buf, im_array);
+                if (c_res || !buf) {
+                    fprintf(stderr, "TOPK with importance matrix compress failed for array, ratio %.2f\n", sparse_ratio);
+                    bsq_free(buf);
+                    return ;
+                }
             }
+            else {
+                int c_res = bsq_compress_2d(ubatch->backend_embd, tensors->sub_gf_out->ne[1], tensors->sub_gf_out->ne[0], sparse_ratio, TOPK, &buf, NULL);
+                if (c_res || !buf) {
+                    fprintf(stderr, "TOPK compress failed for array, ratio %.2f\n", sparse_ratio);
+                    bsq_free(buf);
+                    return ;
+                }
+            }
+            end_compute_time = get_iso8601_ms_timestamp();
             buf_size = bsq_get_packed_size(buf);
 
             send_msgs.emplace_back("sub_gf_out", strlen("sub_gf_out"));
@@ -18207,6 +18345,10 @@ static void llama_send_tensors(zmq::socket_t & socket, struct llama_ubatch * uba
                                    sizeof(tensors->sub_gf_out->ne));
             send_msgs.emplace_back(buf, buf_size);
             send_msgs.emplace_back(&buf_size, sizeof(buf_size));
+
+            if (im_array) {
+                free(im_array);
+            }
 
             bsq_free(buf);
             if (enable_comm_compute_log) {
@@ -18862,7 +19004,7 @@ static int llama_decode_internal(
                 struct input_tensors tensors = {sub_gf_out, lctx.inp_pos};
                 const bool is_to_master = my_rank != 0 && is_last_l;
                 zmq::socket_t * s = is_to_master ? lctx.master_socket : lctx.send_socket;
-                llama_send_tensors(*s, &ubatch, &tensors, lctx.cparams.dump_folder, lctx.cparams.enable_comm_compute_log, my_rank, lctx.cparams.comm_datatype, lctx.cparams.comm_sparse_percentage, lctx.cparams.comm_compression_threshold);
+                llama_send_tensors(*s, &ubatch, &tensors, lctx.cparams.dump_folder, lctx.cparams.enable_comm_compute_log, my_rank, lctx.cparams.comm_datatype, lctx.cparams.comm_sparse_percentage, lctx.cparams.comm_compression_threshold, (float *) model.next_node_first_attn_norm->data);
                 if (lctx.cparams.enable_comm_compute_log) {
                     LLAMA_LOG_INFO("[%d][%s][comm][end][send_tensors][sbatch_tokens: %lu, ubatch_tokens: %u, send the result to the next node or the master]\n", my_rank, get_iso8601_ms_timestamp().c_str(), lctx.sbatch.n_tokens, ubatch.n_tokens);
                 }
